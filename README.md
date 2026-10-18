@@ -16,7 +16,7 @@ An independent native Android TV/Google TV BBC player, ported from Beeb's public
 
 ## Download and install
 
-**[Download the latest APK](https://github.com/usefulappmaker/beeb-android/releases/latest)** · [All releases](https://github.com/usefulappmaker/beeb-android/releases)
+**[Download APK 0.1.1](https://github.com/usefulappmaker/beeb-android/releases/download/v0.1.1/Beeb-Android-0.1.1.apk)** · [All releases](https://github.com/usefulappmaker/beeb-android/releases)
 
 For the initial pre-release, use [version 0.1.1](https://github.com/usefulappmaker/beeb-android/releases/tag/v0.1.1).
 
@@ -57,6 +57,7 @@ Install Android Studio with the Android SDK Platform 37, Build Tools 36/37 and P
 Open this folder in Android Studio and let Gradle sync. Or on a Mac with the default Android Studio/SDK locations:
 
 ```sh
+chmod +x build.sh gradlew setup-uhd.command
 ./build.sh assembleDebug testDebugUnitTest lintDebug
 ```
 
