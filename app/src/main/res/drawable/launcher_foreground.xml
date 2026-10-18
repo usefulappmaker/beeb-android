@@ -1,0 +1,3 @@
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:gravity="center" android:width="46dp" android:height="52dp" android:drawable="@drawable/beeb_mark" />
+</layer-list>
