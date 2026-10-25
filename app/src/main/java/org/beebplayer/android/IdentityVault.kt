@@ -25,22 +25,55 @@ import javax.net.ssl.X509TrustManager
 
 class IdentityVault(context: Context) {
     private val file = context.noBackupFilesDir.resolve("uhd-identity.bin")
+    private val recovery = context.noBackupFilesDir.resolve("uhd-identity-recovery.bin")
     private val alias = "BeebUhdWrappingKey"
-    private fun key(): SecretKey {
+    private fun key(create: Boolean = false): SecretKey {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (store.getKey(alias, null) as? SecretKey)?.let { return it }
+        check(create) { "The saved UHD wrapping key is unavailable. Restore a backup or reconnect TwinVine." }
         return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").apply {
             init(KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT).setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).setRandomizedEncryptionRequired(true).build())
         }.generateKey()
     }
-    private fun read(): JSONObject {
-        val bytes = file.readBytes(); require(bytes.size > 28)
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
-        return JSONObject(String(cipher.doFinal(bytes.copyOfRange(12, bytes.size)), Charsets.UTF_8))
+    @Synchronized private fun read(): JSONObject {
+        var failure: Exception? = null
+        for (candidate in listOf(file, recovery)) {
+            if (!candidate.exists() && !candidate.resolveSibling(candidate.name + ".bak").exists()) continue
+            try {
+                val bytes = android.util.AtomicFile(candidate).openRead().use { it.readBytes() }
+                require(bytes.size in 29..262144)
+                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
+                val result = JSONObject(String(cipher.doFinal(bytes.copyOfRange(12, bytes.size)), Charsets.UTF_8))
+                // Migrate a legacy install in place, and repair a damaged/missing primary from its recovery copy.
+                if (candidate == recovery) runCatching { atomicWrite(file, bytes) }
+                if (!recovery.exists()) runCatching { atomicWrite(recovery, bytes) }
+                return result
+            } catch (e: Exception) { failure = e }
+        }
+        throw failure ?: IllegalStateException("No saved UHD identity")
+    }
+    private fun atomicWrite(target: java.io.File, bytes: ByteArray) {
+        val atomic = android.util.AtomicFile(target); val stream = atomic.startWrite()
+        try { stream.write(bytes); atomic.finishWrite(stream) } catch (e: Exception) { atomic.failWrite(stream); throw e }
+    }
+    @Synchronized private fun save(j: JSONObject) {
+        val store = identity(j); val aliases = store.aliases().toList()
+        require(aliases.any { store.isKeyEntry(it) }) { "Setup package contains no identity" }
+        aliases.mapNotNull { store.getCertificate(it) as? X509Certificate }.forEach { it.checkValidity() }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key(true)) }
+        val bytes = cipher.iv + cipher.doFinal(j.toString().toByteArray(Charsets.UTF_8))
+        atomicWrite(file, bytes); atomicWrite(recovery, bytes)
     }
     fun configured() = runCatching { read(); true }.getOrDefault(false)
-    fun forget() { file.delete(); KeyStore.getInstance("AndroidKeyStore").apply { load(null); deleteEntry(alias) } }
+    fun status(): String = if (configured()) "UHD identity connected · saved on this TV" else if (file.exists() || recovery.exists()) "Saved UHD identity cannot be unlocked. Restore a backup or reconnect TwinVine; the existing files have been preserved." else "No UHD identity saved. Enable BBC UHD or restore your encrypted backup."
+    @Synchronized fun forget() {
+        android.util.AtomicFile(file).delete(); android.util.AtomicFile(recovery).delete()
+        file.resolveSibling("uhd-identity.tmp").delete()
+        KeyStore.getInstance("AndroidKeyStore").apply { load(null); deleteEntry(alias) }
+    }
+    fun exportBackup(password: CharArray): ByteArray { val plain = read().toString().toByteArray(Charsets.UTF_8); return try { IdentityBackup.encrypt(plain, password) } finally { plain.fill(0) } }
+    fun importBackup(bytes: ByteArray, password: CharArray) { val plain = IdentityBackup.decrypt(bytes, password); try { save(JSONObject(String(plain, Charsets.UTF_8))) } finally { plain.fill(0) } }
     private fun identity(j: JSONObject): KeyStore {
         val data = Base64.decode(j.getString("p12"), Base64.DEFAULT)
         require(data.size < 131072 && j.text("userAgent").isNotBlank() && j.text("userAgent").length < 2048 && !j.text("userAgent").contains(Regex("[\\r\\n]"))) { "Invalid setup package" }
@@ -73,17 +106,14 @@ class IdentityVault(context: Context) {
             } ?: error("Empty setup response")
             require(bytes.size < 131072) { "Setup response too large" }; JSONObject(String(bytes, Charsets.UTF_8))
         }
-        val store = identity(j)
-        val aliases = store.aliases().toList()
-        require(aliases.any { store.isKeyEntry(it) }) { "Setup package contains no identity" }
-        aliases.mapNotNull { store.getCertificate(it) as? X509Certificate }.forEach { it.checkValidity() }
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key()) }
-        val temp = file.resolveSibling("uhd-identity.tmp")
-        temp.writeBytes(cipher.iv + cipher.doFinal(j.toString().toByteArray(Charsets.UTF_8)))
-        check(temp.renameTo(file)) { "Unable to save setup" }
+        save(j)
     }
-    fun selectorClient(): OkHttpClient {
-        val j = read(); val store = identity(j)
+
+    fun selectorClient(): OkHttpClient = candidateClient(read())
+    internal fun installCandidate(payload: JSONObject) { save(payload) }
+    internal fun candidateClient(j: JSONObject): OkHttpClient {
+        val store = identity(j)
+        store.aliases().toList().mapNotNull { store.getCertificate(it) as? X509Certificate }.forEach { it.checkValidity() }
         val km = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()).apply { init(store, j.getString("password").toCharArray()) }
         val tm = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply { init(null as KeyStore?) }.trustManagers.filterIsInstance<X509TrustManager>().first()
         val tls = SSLContext.getInstance("TLS").apply { init(km.keyManagers, arrayOf(tm), SecureRandom()) }

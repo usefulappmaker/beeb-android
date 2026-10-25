@@ -6,14 +6,14 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 EXCLUDE = {'build', '.gradle', '.gradle-user', '.kotlin', '.idea', '.git', '__pycache__', 'dist'}
-EXTENSIONS = {'.kt', '.kts', '.xml', '.png', '.md', '.txt', '.py', '.sh', '.command', '.bat', '.properties'}
+EXTENSIONS = {'.kt', '.kts', '.xml', '.png', '.md', '.txt', '.py', '.sh', '.command', '.bat', '.properties', '.json'}
 
 
 def main():
     files = []
     for path in sorted(ROOT.rglob('*')):
         relative = path.relative_to(ROOT)
-        if any(part in EXCLUDE or part.startswith('.venv') for part in relative.parts):
+        if any(part in EXCLUDE or part.startswith('.venv') or part.startswith('._') for part in relative.parts):
             continue
         if not path.is_file() or path.name in {'local.properties', '.DS_Store'}:
             continue
@@ -27,7 +27,7 @@ def main():
         if re.search(rb'-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----', data):
             raise SystemExit('Private key in ' + relative.as_posix())
         files.append((relative, data))
-    out = ROOT / 'dist/Beeb-Android-0.1.1-source.zip'
+    out = ROOT / 'dist/Beeb-Android-0.1.5-source.zip'
     out.parent.mkdir(exist_ok=True)
     with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as archive:
         for relative, data in files:

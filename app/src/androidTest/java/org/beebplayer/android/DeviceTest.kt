@@ -77,10 +77,29 @@ class DeviceTest {
             Thread.sleep(1000)
             val j = runCatching { JSONObject(diagnostic.readText()) }.getOrNull() ?: continue
             if (j.optInt("height") > 0 && j.optLong("positionMs") > 1000) { decoded = true; break }
-            if (j.optString("failure").isNotEmpty()) error("Native player failed: ${j.optString("failure")}")
+            if (j.optString("failure").isNotEmpty()) error("Native player failed: ${j.optString("failure")} ${j.optString("failureDetail")}")
         }
         assertTrue("Real BBC video must decode and advance", decoded)
-        instrument.runOnMainSync { activity.debugSeek(65_000) }
+        // Real transport actions: paused controls must persist, playing controls must fade,
+        // and a modal quality sheet must remain usable beyond the fade timeout.
+        instrument.runOnMainSync { activity.debugControls().play.performClick() }
+        Thread.sleep(2000)
+        var ui = JSONObject()
+        instrument.runOnMainSync { ui = activity.debugSnapshot() }
+        assertEquals("Play", ui.optString("playLabel")); assertTrue(ui.optBoolean("controlsVisible"))
+        instrument.runOnMainSync { activity.debugControls().play.performClick() }
+        Thread.sleep(2500)
+        instrument.runOnMainSync { ui = activity.debugSnapshot() }
+        assertFalse("Transport must fade during playback", ui.optBoolean("controlsVisible"))
+        instrument.runOnMainSync { activity.debugControls().show(); activity.debugControls().quality.performClick() }
+        Thread.sleep(2000)
+        var open = false
+        instrument.runOnMainSync { open = activity.debugControls().debugDialogShowing(); activity.debugControls().debugDismissDialog() }
+        assertTrue("Quality dialog must survive the transport timeout", open)
+        instrument.runOnMainSync { activity.debugControls().show(); activity.debugControls().play.performClick() }
+        Thread.sleep(500)
+        instrument.uiAutomation.takeScreenshot()?.let { bitmap -> context.filesDir.resolve("cinema-controls.png").outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) } }
+        instrument.runOnMainSync { activity.debugControls().play.performClick(); activity.debugSeek(65_000) }
         Thread.sleep(1500)
         var before = JSONObject()
         instrument.runOnMainSync { before = activity.debugSnapshot(); activity.debugRewindCheck() }

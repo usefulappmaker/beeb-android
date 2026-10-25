@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package org.beebplayer.android
 
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import android.app.AlertDialog
@@ -24,9 +25,48 @@ import android.widget.*
 import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
+    private var directSetup: UhdSetupSession? = null
+    private var setupProgress: AlertDialog? = null
+    private var backupProgress: AlertDialog? = null
+    private var pendingBackup: ByteArray? = null
+    private val exportBackup = registerForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        val bytes = pendingBackup; pendingBackup = null
+        if (uri != null && bytes != null) io.execute {
+            val result = runCatching { contentResolver.openOutputStream(uri)?.use { it.write(bytes) } ?: error("Unable to open backup destination") }
+            bytes.fill(0)
+            main.post { if (!isDestroyed) Toast.makeText(this, if (result.isSuccess) "Encrypted UHD backup saved. Keep its password separately." else "Unable to save backup", Toast.LENGTH_LONG).show() }
+        } else bytes?.fill(0)
+    }
+    private val restoreBackup = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) restoreFromUri(uri) }
+    private fun restoreFromUri(uri: android.net.Uri) {
+        io.execute {
+            val result = runCatching { contentResolver.openInputStream(uri)?.use { input ->
+                val output = java.io.ByteArrayOutputStream(); val buffer = ByteArray(4096)
+                while (output.size() <= IdentityBackup.MAX_BYTES) { val n = input.read(buffer); if (n < 0) break; output.write(buffer, 0, n) }
+                output.toByteArray().also { require(it.size <= IdentityBackup.MAX_BYTES) { "Backup is too large" } }
+            } ?: error("Unable to read backup") }
+            main.post { if (!isDestroyed) result.fold({ bytes -> passwordPrompt("Restore UHD backup", false) { password ->
+                showBackupProgress("Restoring UHD backup…")
+                io.execute { val restored = runCatching { api.vault.importBackup(bytes, password) }; password.fill('\u0000'); bytes.fill(0); main.post { if (!isDestroyed) { backupProgress?.dismiss(); backupProgress = null; settings(); Toast.makeText(this, if (restored.isSuccess) "UHD identity restored" else restored.exceptionOrNull()?.message ?: "Unable to restore backup", Toast.LENGTH_LONG).show() } } }
+            } }, { Toast.makeText(this, it.message ?: "Unable to read backup", Toast.LENGTH_LONG).show() }) }
+        }
+    }
+    private var searchQuery = ""
+    private var searchInput: EditText? = null
+    private var searchUpdate: Runnable? = null
+    private var refreshingCatalogue = false
+    private val catalogue by lazy { CatalogueIndex(this, api) }
+    private val voiceSearch = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val query = result.data?.getStringArrayListExtra(android.speech.RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
+        if (result.resultCode == RESULT_OK && !query.isNullOrBlank()) { searchQuery = query; search() }
+    }
     private lateinit var api: BbcApi
     private lateinit var store: LocalStore
     private lateinit var body: LinearLayout
+    private lateinit var pageHeader: LinearLayout
+    private val tabViews = mutableMapOf<String, LinearLayout>()
+    private var platformBack: android.window.OnBackInvokedCallback? = null
+    private var episodePanel: android.app.Dialog? = null
     private lateinit var content: LinearLayout
     private val io = Executors.newFixedThreadPool(3)
     private val main = Handler(Looper.getMainLooper())
@@ -50,26 +90,78 @@ class MainActivity : ComponentActivity() {
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(ink); setPadding(dp(38), dp(18), dp(38), dp(12)) }
         val nav = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         nav.addView(ImageView(this).apply { setImageResource(R.drawable.beeb_mark) }, LinearLayout.LayoutParams(dp(48), dp(48)))
-        for (tab in listOf("Home", "Browse", "Live", "Saved", "Settings")) nav.addView(button(tab) { backStack.clear(); currentTab = tab; when (tab) { "Home" -> home(); "Browse" -> browse(); "Live" -> live(); "Saved" -> saved(); else -> settings() } }, LinearLayout.LayoutParams(-2, dp(50)).apply { marginStart = dp(12) })
+        for (tab in listOf("Home", "Browse", "Search", "Live", "Saved", "Settings")) {
+            val item = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+                isFocusable = true; isFocusableInTouchMode = true; contentDescription = tab
+                setPadding(dp(18), dp(4), dp(18), 0)
+                addView(label(tab, 19f).apply { gravity = Gravity.CENTER; setPadding(0, dp(6), 0, dp(8)) }, LinearLayout.LayoutParams(-2, -2))
+                addView(View(this@MainActivity), LinearLayout.LayoutParams(dp(24), dp(3)))
+                setOnFocusChangeListener { _, _ -> updateTabs() }
+                setOnClickListener {
+                    backStack.clear(); currentTab = tab
+                    when (tab) { "Home" -> home(); "Browse" -> browse(); "Search" -> search(); "Live" -> live(); "Saved" -> saved(); else -> settings() }
+                }
+            }
+            tabViews[tab] = item
+            nav.addView(item, LinearLayout.LayoutParams(-2, dp(50)).apply { marginStart = dp(6) })
+        }
+        updateTabs()
         root.addView(nav)
         val scroll = ScrollView(this).apply { isFillViewport = true; clipToPadding = false }
-        body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(10), dp(24), dp(10), dp(30)); clipChildren = false }
-        scroll.addView(body); root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f)); setContentView(root)
-        home()
+        body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(10), dp(8), dp(10), dp(30)); clipChildren = false }
+        scroll.addView(body); root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(24) }); setContentView(root)
+        if (!handleLaunch(intent)) home()
+        io.execute { LiveHomeChannels.refreshIfNeeded(this) }
     }
-    override fun onResume() { super.onResume(); main.postDelayed(rotate, 8000); main.postDelayed(liveRefresh, 60_000); if (::store.isInitialized && currentTab == "Home" && backStack.isEmpty() && homeFeed != null) renderHome() }
-    override fun onPause() { main.removeCallbacks(rotate); main.removeCallbacks(liveRefresh); super.onPause() }
-    override fun onDestroy() { generation++; io.shutdownNow(); super.onDestroy() }
-    private fun navigateBack() { if (backStack.isNotEmpty()) backStack.removeAt(backStack.lastIndex).invoke() else if (currentTab != "Home") { currentTab = "Home"; home() } else finish() }
+    override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); setIntent(intent); handleLaunch(intent) }
+    private fun handleLaunch(incoming: Intent): Boolean {
+        if (incoming.action == Intent.ACTION_APPLICATION_PREFERENCES) { currentTab = "Settings"; settings(); return true }
+        val channel = LiveHomeChannels.channelId(incoming) ?: return false
+        backStack.clear(); currentTab = "Live"; live()
+        if (channel != "all") startActivity(Intent(this, PlaybackActivity::class.java).putExtra("channel", channel).putExtra("title", "BBC Live"))
+        return true
+    }
+    override fun onResume() { super.onResume();
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            platformBack = android.window.OnBackInvokedCallback { navigateBack() }
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, platformBack!!)
+        }
+ main.postDelayed(rotate, 8000); main.postDelayed(liveRefresh, 60_000); if (::store.isInitialized && currentTab == "Home" && backStack.isEmpty() && homeFeed != null) renderHome() }
+    override fun onPause() {
+        if (android.os.Build.VERSION.SDK_INT >= 33) platformBack?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
+        platformBack = null
+        main.removeCallbacks(rotate); main.removeCallbacks(liveRefresh); super.onPause() }
+    override fun onDestroy() { directSetup?.cancel(); setupProgress?.dismiss(); episodePanel?.dismiss(); backupProgress?.dismiss(); generation++; io.shutdownNow(); super.onDestroy() }
+    private fun navigateBack() { if (episodePanel?.isShowing == true) episodePanel?.dismiss() else if (backStack.isNotEmpty()) backStack.removeAt(backStack.lastIndex).invoke() else if (currentTab != "Home") { currentTab = "Home"; home() } else finish() }
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
     private fun label(text: String, size: Float = 22f, muted: Boolean = false) = TextView(this).apply { this.text = text; textSize = size; setTextColor(if (muted) 0xFFB6B2C0.toInt() else Color.WHITE); setPadding(0, dp(6), 0, dp(8)) }
     private fun border(focused: Boolean) = GradientDrawable().apply { setColor(if (focused) 0xFF382039.toInt() else 0xFF1C1B24.toInt()); cornerRadius = dp(10).toFloat(); setStroke(dp(if (focused) 3 else 1), if (focused) pink else 0xFF47434E.toInt()) }
     private fun focus(view: View) { view.isFocusable = true; view.isFocusableInTouchMode = true; view.background = border(false); view.setOnFocusChangeListener { v, on -> v.background = border(on) } }
     private fun button(text: String, action: () -> Unit) = Button(this).apply { this.text = text; isAllCaps = false; textSize = 18f; setTextColor(Color.WHITE); setPadding(dp(20), dp(8), dp(20), dp(8)); focus(this); setOnClickListener { action() } }
+    private fun updateTabs() {
+        tabViews.forEach { (name, item) ->
+            val selected = name == currentTab
+            val focused = item.hasFocus()
+            (item.getChildAt(0) as TextView).apply {
+                setTextColor(if (selected || focused) Color.WHITE else 0xFFAAA9B2.toInt())
+                setTypeface(null, if (selected || focused) Typeface.BOLD else Typeface.NORMAL)
+            }
+            item.getChildAt(1).background = GradientDrawable().apply {
+                cornerRadius = dp(2).toFloat()
+                setColor(if (focused) Color.WHITE else if (selected) pink else Color.TRANSPARENT)
+            }
+            item.animate().scaleX(if (focused) 1.04f else 1f).scaleY(if (focused) 1.04f else 1f).setDuration(120).start()
+        }
+    }
     private fun reset(title: String): Int {
-        generation++; body.removeAllViews(); banner = null
-        if (backStack.isNotEmpty()) body.addView(button("‹ Back") { navigateBack() })
-        if (title != "Home") body.addView(label(title, 30f).apply { setTypeface(typeface, Typeface.BOLD) })
+        generation++; searchInput = null; searchUpdate?.let(main::removeCallbacks); body.removeAllViews(); banner = null
+        updateTabs()
+        pageHeader = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(0, 0, 0, dp(8)) }
+        if (title != "Home") {
+            pageHeader.addView(label(title, 30f).apply { setTypeface(typeface, Typeface.BOLD) }, LinearLayout.LayoutParams(0, -2, 1f))
+            body.addView(pageHeader)
+        }
         content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; clipChildren = false }; body.addView(content)
         return generation
     }
@@ -79,9 +171,21 @@ class MainActivity : ComponentActivity() {
     }
     private fun image(url: String, height: Int) = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP; setBackgroundColor(0xFF24212A.toInt()); layoutParams = LinearLayout.LayoutParams(-1, dp(height)); contentDescription = null; if (url.isNotEmpty()) Images.load(api, url, this) }
     private fun card(p: Programme, action: () -> Unit): View = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(8), dp(8), dp(8)); focus(this); contentDescription = p.title + " " + p.subtitle
-        addView(image(p.image, 125)); addView(label(p.subtitle.ifEmpty { p.title }, 18f).apply { maxLines = 2; minLines = 2 })
-        if (p.uhd) addView(label(if (p.hdr) "4K HDR" else "4K", 14f, true))
+        orientation = LinearLayout.VERTICAL; setPadding(dp(4), dp(4), dp(4), dp(4))
+        isFocusable = true; isFocusableInTouchMode = true; contentDescription = p.title + " " + p.subtitle
+        val art = image(p.image, 140).apply {
+            background = GradientDrawable().apply { setColor(0xFF24212A.toInt()); cornerRadius = dp(8).toFloat() }
+            clipToOutline = true
+        }
+        addView(art)
+        val caption = label(p.subtitle.ifEmpty { p.title }, 17f).apply { maxLines = 2; minLines = 2; setPadding(dp(2), dp(10), dp(2), 0) }
+        addView(caption)
+        if (p.uhd) addView(label(if (p.hdr) "4K HDR" else "4K", 12f, true))
+        setOnFocusChangeListener { _, on ->
+            art.foreground = if (on) GradientDrawable().apply { setColor(Color.TRANSPARENT); cornerRadius = dp(8).toFloat(); setStroke(dp(3), Color.WHITE) } else null
+            caption.setTextColor(if (on) Color.WHITE else 0xFFCDCCD4.toInt())
+            animate().scaleX(if (on) 1.025f else 1f).scaleY(if (on) 1.025f else 1f).setDuration(120).start()
+        }
         setOnClickListener { action() }
     }
     private fun row(title: String, programmes: List<Programme>, onSelect: (Programme) -> Unit) {
@@ -155,21 +259,119 @@ class MainActivity : ComponentActivity() {
         feed.rows.take(8).forEach { (title, shows) -> row(title, shows, ::openShow) }
         content.addView(button("Refresh Home") { homeFeed = null; home() })
     }
+    private fun discoveryText(text: String, action: () -> Unit) = TextView(this).apply {
+        this.text=text; textSize=19f; gravity=Gravity.CENTER_VERTICAL
+        isFocusable=true; isFocusableInTouchMode=true; setPadding(dp(18),dp(12),dp(18),dp(12))
+        setTextColor(0xFFCDCCD4.toInt())
+        setOnFocusChangeListener { _, focused ->
+            setTextColor(if(focused) Color.WHITE else 0xFFCDCCD4.toInt())
+            setTypeface(null,if(focused) Typeface.BOLD else Typeface.NORMAL)
+            background=if(focused) GradientDrawable().apply { setColor(0xFF302B36.toInt()); cornerRadius=dp(24).toFloat() } else null
+        }
+        setOnClickListener { action() }
+    }
     private fun browse() {
-        returnScreen = { browse() }
-        reset("Browse")
-        content.addView(label("A–Z", 22f))
-        val letters = listOf("0-9") + ('a'..'z').map(Char::toString)
-        val line = LinearLayout(this)
-        letters.forEach { letter -> line.addView(button(letter.uppercase()) { page(letter, false, 1) }) }
+        returnScreen = { browse() }; reset("Browse")
+        content.addView(label("Discover",22f))
+        content.addView(discoveryText("4K UHD   ›") { uhdCatalogue() },LinearLayout.LayoutParams(-1,dp(58)))
+        content.addView(label("Categories",22f))
+        val categoriesHost=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL }
+        content.addView(categoriesHost)
+        content.addView(label("A–Z",22f).apply { setPadding(0,dp(22),0,dp(10)) })
+        val line=LinearLayout(this)
+        (listOf("0-9")+('a'..'z').map(Char::toString)).forEach { letter ->
+            line.addView(discoveryText(letter.uppercase()) { page(letter,false,1) },LinearLayout.LayoutParams(if(letter=="0-9")dp(74) else dp(52),dp(50)))
+        }
         content.addView(HorizontalScrollView(this).apply { addView(line) })
-        val id = generation
-        io.execute { val genres = runCatching { api.genres() }; main.post { if (generation == id) genres.fold({ categories -> content.addView(label("Categories", 22f)); categories.chunked(4).forEach { group -> val r = LinearLayout(this); group.forEach { (key, title) -> r.addView(button(title) { page(key, true, 1) }, LinearLayout.LayoutParams(0, dp(56), 1f)) }; content.addView(r) } }, { content.addView(label("Categories unavailable; A–Z is still available.", 18f, true)) }) } }
+        val id=generation
+        io.execute { val result=runCatching { api.genres() }; main.post { if(generation==id && !isDestroyed) result.fold({ categories ->
+            categories.chunked(3).forEach { group -> val row=LinearLayout(this); group.forEach { (key,title) ->
+                row.addView(discoveryText(title) { page(key,true,1) },LinearLayout.LayoutParams(0,dp(54),1f).apply { marginEnd=dp(14) })
+            }; repeat(3-group.size) { row.addView(View(this),LinearLayout.LayoutParams(0,1,1f)) }; categoriesHost.addView(row) }
+        },{ categoriesHost.addView(label("Categories unavailable. A–Z and 4K UHD are still available.",16f,true)) }) } }
+    }
+    private fun uhdCatalogue() {
+        if(backStack.isEmpty()) backStack.add { browse() }
+        returnScreen={ uhdCatalogue() }; reset("4K UHD")
+        val items=catalogue.allUhd()
+        content.addView(label("${items.size} programmes",16f,true))
+        var shown=0
+        lateinit var more: TextView
+        fun append() {
+            if(::content.isInitialized) content.removeView(more)
+            val next=items.drop(shown).take(30); shown+=next.size; grid(next,::openShow)
+            more.text="Show more programmes  ›"; if(shown<items.size) content.addView(more)
+        }
+        more=discoveryText("Show more programmes  ›") { append() }; append()
+        val status=label("",15f,true);content.addView(status)
+        content.addView(discoveryText("Refresh catalogue") { refreshCatalogue(status,true) { if(currentTab=="Browse") uhdCatalogue() } })
+        refreshCatalogue(status,false) { if(currentTab=="Browse") uhdCatalogue() }
+    }
+    private fun refreshCatalogue(status: TextView, force: Boolean, done: () -> Unit) {
+        if(refreshingCatalogue || !force && !catalogue.needsRefresh()) return
+        refreshingCatalogue=true;status.text="Updating programme catalogue…"
+        io.execute { val result=runCatching { catalogue.refresh() }; main.post {
+            refreshingCatalogue=false
+            if(!isDestroyed && status.isAttachedToWindow) result.fold({ status.text="Catalogue updated";done() },{ status.text="Using the saved catalogue. Refresh is unavailable right now." })
+        } }
+    }
+    private fun search() {
+        currentTab="Search"; returnScreen={ search() }; reset("Search")
+        val bar=LinearLayout(this).apply { gravity=Gravity.CENTER_VERTICAL; setPadding(dp(10),dp(3),dp(10),dp(3)); background=GradientDrawable().apply { setColor(0xFF24212B.toInt());cornerRadius=dp(30).toFloat() } }
+        val field=EditText(this).apply {
+            hint="Search programmes";textSize=20f;setTextColor(Color.WHITE);setHintTextColor(0xFFAAA9B2.toInt())
+            setSingleLine(true);inputType=InputType.TYPE_CLASS_TEXT;imeOptions=android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH
+            filters=arrayOf(android.text.InputFilter.LengthFilter(200));background=null;setPadding(dp(16),dp(12),dp(16),dp(12));setText(searchQuery)
+        }; searchInput=field
+        bar.addView(field,LinearLayout.LayoutParams(0,dp(58),1f))
+        val mic=ImageButton(this).apply {
+            contentDescription="Search by voice";setImageResource(R.drawable.search_mic);imageTintList=android.content.res.ColorStateList.valueOf(Color.WHITE)
+            setPadding(dp(14),dp(14),dp(14),dp(14));isFocusable=true
+            background=GradientDrawable().apply { shape=GradientDrawable.OVAL;setColor(0xFF393340.toInt()) }
+            setOnFocusChangeListener { _,on -> background=GradientDrawable().apply { shape=GradientDrawable.OVAL;setColor(if(on)0xFF63546B.toInt() else 0xFF393340.toInt()) } }
+            setOnClickListener {
+                val intent=Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                    .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL,android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                    .putExtra(android.speech.RecognizerIntent.EXTRA_PROMPT,"Search Beeb programmes")
+                    .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE,java.util.Locale.getDefault().toLanguageTag())
+                runCatching { voiceSearch.launch(intent) }.onFailure {
+                    Toast.makeText(this@MainActivity,"Voice input is unavailable on this device. Use the keyboard instead.",Toast.LENGTH_LONG).show()
+                    field.requestFocus(); (getSystemService(INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager).showSoftInput(field,android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+                }
+            }
+        }
+        bar.addView(mic,LinearLayout.LayoutParams(dp(50),dp(50)))
+        content.addView(bar)
+        val status=label("",15f,true);content.addView(status)
+        val results=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL };content.addView(results)
+        fun render() {
+            if(searchInput!==field) return
+            results.removeAllViews(); val previous=content;content=results
+            val matches=catalogue.search(searchQuery)
+            content.addView(label(if(searchQuery.isBlank()) "Find programmes by title or description" else "${matches.size} ${if(matches.size==1) "result" else "results"} for “$searchQuery”",18f,true))
+            var shown=0;lateinit var more: TextView
+            fun append() { results.removeView(more);val next=matches.drop(shown).take(30);shown+=next.size;val old=content;content=results;grid(next,::openShow);content=old;if(shown<matches.size)results.addView(more) }
+            more=discoveryText("More results  ›") { append() };append()
+            content=previous
+        }
+        field.addTextChangedListener(object:android.text.TextWatcher {
+            override fun beforeTextChanged(s:CharSequence?,start:Int,count:Int,after:Int)=Unit
+            override fun onTextChanged(s:CharSequence?,start:Int,before:Int,count:Int) { searchQuery=s.toString().take(200); searchUpdate?.let(main::removeCallbacks);searchUpdate=Runnable { render() };main.postDelayed(searchUpdate!!,250) }
+            override fun afterTextChanged(s:android.text.Editable?)=Unit
+        })
+        field.setOnEditorActionListener { _,action,event ->
+            if(action==android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH || event?.keyCode==KeyEvent.KEYCODE_ENTER) {
+                (getSystemService(INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager).hideSoftInputFromWindow(field.windowToken,0)
+                render();val first=(0 until results.childCount).map { results.getChildAt(it) }.filterIsInstance<LinearLayout>().firstOrNull()?.getChildAt(0);first?.requestFocus();true
+            } else false
+        }
+        content.addView(discoveryText("Refresh catalogue") { refreshCatalogue(status,true) { render() } })
+        render();refreshCatalogue(status,false) { render() }
     }
     private fun page(key: String, category: Boolean, number: Int) {
         if (backStack.isEmpty()) backStack.add { browse() }
         returnScreen = { page(key, category, number) }
-        load("Browse · ${key.replaceFirstChar(Char::uppercase)}", { api.page(key, category, number) }) { result ->
+        load(key.replaceFirstChar(Char::uppercase), { api.page(key, category, number) }) { result ->
             val bar = LinearLayout(this); if (number > 1) bar.addView(button("‹ Previous") { page(key, category, number - 1) }); bar.addView(label("  Page $number / ${result.totalPages}  ", 18f)); if (number < result.totalPages) bar.addView(button("Next ›") { page(key, category, number + 1) }); content.addView(bar)
             grid(result.shows, ::openShow)
         }
@@ -178,10 +380,25 @@ class MainActivity : ComponentActivity() {
         val previousScreen = returnScreen
         backStack.add(previousScreen)
         load(show.title, { api.episodes(show) }) { episodes ->
+            io.execute { runCatching { catalogue.discover(show,episodes) } }
             content.addView(label(show.summary, 19f, true))
-            lateinit var bookmark: Button
-            bookmark = button(if (store.isSaved(show)) "Remove saved programme" else "Save programme") { store.toggle(show); bookmark.text = if (store.isSaved(show)) "Remove saved programme" else "Save programme" }
-            content.addView(bookmark)
+            val bookmark = ImageButton(this).apply {
+                setPadding(dp(12), dp(12), dp(12), dp(12)); isFocusable = true
+                fun update() {
+                    val saved = store.isSaved(show)
+                    setImageResource(if (saved) R.drawable.bookmark_filled else R.drawable.bookmark_outline)
+                    imageTintList = android.content.res.ColorStateList.valueOf(if (saved) pink else Color.WHITE)
+                    contentDescription = if (saved) "Remove saved programme" else "Save programme"
+                    tooltipText = contentDescription
+                    isSelected = saved
+                }
+                fun backgroundFor(on: Boolean) = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(if (on) 0xFF494650.toInt() else 0xFF24212B.toInt()) }
+                background = backgroundFor(false)
+                setOnFocusChangeListener { _, on -> background = backgroundFor(on) }
+                update()
+                setOnClickListener { store.toggle(show); update(); announceForAccessibility(if (store.isSaved(show)) "Programme saved" else "Programme removed from Saved") }
+            }
+            pageHeader.addView(bookmark, LinearLayout.LayoutParams(dp(48), dp(48)))
             if (episodes.isEmpty()) content.addView(label("No episodes available.", 20f))
             val episodeHost = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
             val groups = episodes.groupBy { it.series }
@@ -195,36 +412,182 @@ class MainActivity : ComponentActivity() {
                     episode(p, next)
                 }; content = previous
             }
-            if (groups.size > 1) { val line = LinearLayout(this); groups.forEach { (title, items) -> line.addView(button(title) { showSeries(items) }) }; content.addView(HorizontalScrollView(this).apply { addView(line) }) }
+            if (groups.size > 1) {
+                val line = LinearLayout(this).apply { setPadding(0, dp(8), 0, dp(12)) }
+                var selected = groups.keys.first()
+                fun updateSeries() {
+                    for (i in 0 until line.childCount) (line.getChildAt(i) as TextView).apply {
+                        val active = tag == selected
+                        setTextColor(if (active) ink else if (hasFocus()) Color.WHITE else 0xFFB6B2C0.toInt())
+                        background = GradientDrawable().apply { cornerRadius = dp(24).toFloat(); setColor(if (active) Color.WHITE else if (hasFocus()) 0xFF393640.toInt() else Color.TRANSPARENT) }
+                    }
+                }
+                groups.forEach { (title, items) ->
+                    val tab = TextView(this).apply {
+                        tag = title; text = if (title == "Episodes") "Specials" else title; textSize = 17f; gravity = Gravity.CENTER; isFocusable = true
+                        setPadding(dp(22), dp(10), dp(22), dp(10))
+                        setOnFocusChangeListener { _, _ -> updateSeries() }
+                        setOnClickListener { selected = title; updateSeries(); showSeries(items) }
+                    }
+                    line.addView(tab, LinearLayout.LayoutParams(-2, dp(44)).apply { marginEnd = dp(10) })
+                }
+                updateSeries()
+                content.addView(HorizontalScrollView(this).apply { addView(line) })
+            }
             content.addView(episodeHost); groups.values.firstOrNull()?.let { showSeries(it) }
         }
     }
     private fun episode(p: Programme, next: Programme?) {
-        val actions = mutableListOf("▶ Play at best available quality")
-        if (store.resume(p) > 0) actions += "Start over"
-        val dialog = AlertDialog.Builder(this).setTitle(p.title + "\n" + p.subtitle).setMessage(p.summary + "\n" + p.duration + if (p.uhd) " · 4K available" else "").setPositiveButton("Play at best available quality") { _, _ -> play(p, next, false) }.apply {
-            if (actions.size > 1) setNeutralButton("Start over") { _, _ -> play(p, next, true) }
-        }.setNegativeButton("Close", null).create()
-        dialog.setOnShowListener { val icon = getDrawable(R.drawable.beeb_mark)!!; icon.setBounds(0, 0, dp(28), dp(28)); dialog.getButton(AlertDialog.BUTTON_POSITIVE).setCompoundDrawables(icon, null, null, null) }
+        episodePanel?.dismiss()
+        val dialog = android.app.Dialog(this)
+        episodePanel = dialog
+        val surface = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = GradientDrawable().apply { setColor(0xFF201F27.toInt()); cornerRadius = dp(24).toFloat() }
+            clipToOutline = true
+        }
+        surface.addView(image(p.image, 390), LinearLayout.LayoutParams(0, -1, .40f))
+        val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(30), dp(24), dp(30), dp(24)); gravity = Gravity.CENTER_VERTICAL; clipChildren = false; clipToPadding = false }
+        info.addView(label(p.title, 14f, true).apply { setTextColor(pink); letterSpacing = .08f })
+        info.addView(label(p.subtitle.ifEmpty { p.title }, 28f).apply { maxLines = 2; setTypeface(null, Typeface.BOLD) })
+        val date = runCatching { java.time.LocalDate.parse(p.date.take(10)).format(java.time.format.DateTimeFormatter.ofPattern("d MMM yyyy", java.util.Locale.UK)) }.getOrDefault(p.date.take(10))
+        val meta = listOf(p.duration, date, if (p.uhd) { if (p.hdr) "4K HDR available" else "4K available" } else "").filter { it.isNotBlank() }.joinToString("   ·   ")
+        info.addView(label(meta, 13f, true))
+        val description = label(p.summary, 16f).apply { setTextColor(0xFFD5D3DD.toInt()); setLineSpacing(dp(3).toFloat(), 1f) }
+        val descriptionScroll = ScrollView(this).apply { isFocusable = true; addView(description) }
+        info.addView(descriptionScroll, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(6); bottomMargin = dp(14) })
+        val actions = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; clipChildren = false; clipToPadding = false }
+        val playButton = ImageButton(this).apply {
+            setImageResource(R.drawable.beeb_mark); scaleType = ImageView.ScaleType.FIT_CENTER
+            setPadding(dp(22), dp(13), dp(22), dp(13)); contentDescription = if (store.resume(p) > 0) "Resume" else "Play"
+            isFocusable = true; isFocusableInTouchMode = true
+            fun appearance(on: Boolean) = GradientDrawable().apply { cornerRadius = dp(28).toFloat(); setColor(if (on) Color.WHITE else 0xFFE3DFE7.toInt()) }
+            background = appearance(false)
+            setOnFocusChangeListener { _, on -> background = appearance(on); animate().scaleX(if (on) 1.07f else 1f).scaleY(if (on) 1.07f else 1f).setDuration(120).start() }
+            setOnClickListener { dialog.dismiss(); play(p, next, false) }
+        }
+        actions.addView(playButton, LinearLayout.LayoutParams(dp(90), dp(54)))
+        if (store.resume(p) > 0) actions.addView(button("Start over") { dialog.dismiss(); play(p, next, true) }, LinearLayout.LayoutParams(-2, dp(54)).apply { marginStart = dp(16) })
+        info.addView(actions)
+        surface.addView(info, LinearLayout.LayoutParams(0, -1, .60f))
+        dialog.setContentView(surface)
+        dialog.window?.apply {
+            setBackgroundDrawableResource(android.R.color.transparent)
+            addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            setDimAmount(.82f)
+        }
+        dialog.setOnDismissListener { episodePanel = null }
         dialog.show()
+        dialog.window?.setLayout(resources.displayMetrics.widthPixels - dp(96), dp(390))
+        playButton.requestFocus()
     }
     private fun play(p: Programme, next: Programme?, restart: Boolean) { startActivity(Intent(this, PlaybackActivity::class.java).putExtra("episode", p.json().toString()).putExtra("next", next?.json()?.toString()).putExtra("restart", restart)) }
     private fun saved() { returnScreen = { saved() }; reset("Saved programmes"); val items = store.saved(); if (items.isEmpty()) content.addView(label("Save a programme from its episode page.", 20f, true)); grid(items, ::openShow) }
     private fun live() { returnScreen = { live() }; load("Live", { api.channels() }) { channels -> grid(channels.map { Programme(it.id, it.title, it.name, image = it.image) }) { p -> startActivity(Intent(this, PlaybackActivity::class.java).putExtra("channel", p.id).putExtra("title", p.title + " · " + p.subtitle)) } } }
+    private fun saveBackupToDownloads(bytes: ByteArray) {
+        if (android.os.Build.VERSION.SDK_INT < 29) {
+            pendingBackup = bytes
+            runCatching { exportBackup.launch("Beeb-UHD-backup.beeb") }.onFailure { pendingBackup?.fill(0); pendingBackup = null; Toast.makeText(this, "No file picker is available. Keep the original TwinVine configuration on your computer.", Toast.LENGTH_LONG).show() }
+            return
+        }
+        showBackupProgress("Saving encrypted backup…")
+        io.execute {
+            val result = runCatching {
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.Downloads.DISPLAY_NAME, "Beeb-UHD-${java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))}.beeb")
+                    put(android.provider.MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
+                    put(android.provider.MediaStore.Downloads.RELATIVE_PATH, "Download/Beeb/")
+                    put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val uri = contentResolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: error("Unable to create backup")
+                try {
+                    contentResolver.openOutputStream(uri)?.use { it.write(bytes) } ?: error("Unable to write backup")
+                    contentResolver.update(uri, android.content.ContentValues().apply { put(android.provider.MediaStore.Downloads.IS_PENDING, 0) }, null, null)
+                } catch (e: Exception) { contentResolver.delete(uri, null, null); throw e }
+            }
+            bytes.fill(0)
+            main.post { if (!isDestroyed) { backupProgress?.dismiss(); backupProgress = null; Toast.makeText(this, if (result.isSuccess) "Encrypted backup saved in Downloads/Beeb. Copy it to your computer and keep the password separately." else "Unable to save backup to Downloads", Toast.LENGTH_LONG).show() } }
+        }
+    }
+    private fun chooseBackup() {
+        io.execute {
+            val choices = mutableListOf<Pair<String, android.net.Uri>>()
+            if (android.os.Build.VERSION.SDK_INT >= 29) runCatching {
+                val collection = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                contentResolver.query(collection, arrayOf(android.provider.MediaStore.Downloads._ID, android.provider.MediaStore.Downloads.DISPLAY_NAME), "${android.provider.MediaStore.Downloads.RELATIVE_PATH} = ?", arrayOf("Download/Beeb/"), "${android.provider.MediaStore.Downloads._ID} DESC")?.use { cursor ->
+                    while (cursor.moveToNext() && choices.size < 30) {
+                        val name = cursor.getString(1)
+                        if (name.startsWith("Beeb-UHD-") && name.endsWith(".beeb")) choices += name to android.content.ContentUris.withAppendedId(collection, cursor.getLong(0))
+                    }
+                }
+            }
+            main.post { if (!isDestroyed) AlertDialog.Builder(this).setTitle("Restore encrypted UHD backup").setItems((choices.map { it.first } + "Choose another file…").toTypedArray()) { _, index ->
+                if (index < choices.size) restoreFromUri(choices[index].second)
+                else runCatching { restoreBackup.launch(arrayOf("*/*")) }.onFailure { Toast.makeText(this, "A file picker is not available on this TV. Reconnect with the computer helper instead.", Toast.LENGTH_LONG).show() }
+            }.setNegativeButton("Cancel", null).show() }
+        }
+    }
+    private fun showBackupProgress(title: String) {
+        backupProgress?.dismiss()
+        backupProgress = AlertDialog.Builder(this).setTitle(title).setMessage("This can take a little while on a TV.").setView(ProgressBar(this)).create().also { it.show() }
+    }
+    private fun passwordPrompt(title: String, confirm: Boolean, action: (CharArray) -> Unit) {
+        val fields = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(24), dp(8), dp(24), 0) }
+        fun field(hint: String) = EditText(this).apply { this.hint = hint; inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD; isSingleLine = true; fields.addView(this) }
+        val first = field("Backup password (at least 12 characters)")
+        val second = if (confirm) field("Repeat password") else null
+        val dialog = AlertDialog.Builder(this).setTitle(title).setView(fields).setPositiveButton(if (confirm) "Save backup" else "Restore", null).setNegativeButton("Cancel", null).create()
+        dialog.setOnShowListener { dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val password = first.text.toString().toCharArray()
+            if (password.size < 12) { first.error = "Use at least 12 characters"; password.fill('\u0000') }
+            else if (second != null && first.text.toString() != second.text.toString()) { second.error = "Passwords do not match"; password.fill('\u0000') }
+            else { first.setText(""); second?.setText(""); dialog.dismiss(); action(password) }
+        } }
+        dialog.show()
+    }
+    private fun enableDirectUhd() {
+        if(directSetup!=null)return
+        val session=UhdSetupSession();directSetup=session
+        val dialog=AlertDialog.Builder(this).setTitle("Enable BBC UHD").setMessage("Downloading and validating UHD setup…")
+            .setView(ProgressBar(this)).setNegativeButton("Cancel") { _,_ -> if(session.cancel() && directSetup===session)directSetup=null }
+            .setOnCancelListener { if(session.cancel() && directSetup===session)directSetup=null }.create()
+        setupProgress=dialog;dialog.show()
+        io.execute {
+            val result=runCatching { DirectUhdSetup.enable(api,session) { message -> main.post { if(directSetup===session && !isDestroyed)dialog.setMessage(message) } } }
+            main.post { if(directSetup===session && !isDestroyed) {
+                directSetup=null;setupProgress=null;dialog.dismiss();settings()
+                val message=result.fold({ title -> "Connected. BBC returned a 4K HLG stream for $title." },{ error ->
+                    if(error is java.util.concurrent.CancellationException) "Setup cancelled. Your existing setup has been kept."
+                    else if(error is DirectUhdSetup.SetupError) error.message.orEmpty()
+                    else "Could not verify BBC UHD access. Your existing setup has been kept. Check your connection and try again."
+                })
+                AlertDialog.Builder(this).setTitle(if(result.isSuccess)"BBC UHD connected" else "BBC UHD setup").setMessage(message).setPositiveButton("OK",null).show()
+            } }
+        }
+    }
     private fun settings() {
         returnScreen = { settings() }
         reset("Settings")
         content.addView(label("Beeb for Android TV · ${BuildConfig.VERSION_NAME}", 22f))
-        content.addView(label("4K HLG · TwinVine", 26f)); content.addView(label(if (api.vault.configured()) "UHD identity connected" else "Optional one-time setup required for UHD", 19f, true))
-        content.addView(label("Run the setup helper on your computer, then enter its complete one-time URL. After connecting, playback runs directly on this TV.", 18f, true))
-        val input = EditText(this).apply { hint = "One-time setup URL"; setTextColor(Color.WHITE); setHintTextColor(Color.LTGRAY); inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI; isSingleLine = true }
-        content.addView(input)
-        val status = label("", 18f, true)
-        content.addView(button("Connect TwinVine") {
-            val link = input.text.toString(); input.setText(""); status.text = "Connecting…"; val id = generation
-            io.execute { val result = runCatching { api.vault.connect(link) }; main.post { if (generation == id) result.fold({ settings(); Toast.makeText(this, "Connected. You can close the computer helper.", Toast.LENGTH_LONG).show() }, { status.text = it.message ?: "Setup failed" }) } }
-        }); content.addView(status)
+        content.addView(label("4K HLG · TwinVine", 26f)); content.addView(label(api.vault.status(), 19f, true))
+        content.addView(label("Enable 4K playback directly on this TV. Beeb downloads the UHD configuration, validates it and checks BBC access before saving it securely. No computer or helper is needed.",18f,true))
+        content.addView(button("Enable BBC UHD") { enableDirectUhd() })
+        content.addView(label("Normal updates keep the saved identity on this TV. A password-protected backup can also restore it after clearing storage, reinstalling or changing devices. Save that backup somewhere you control and keep its password separately.", 17f, true))
+        if (api.vault.configured()) content.addView(button("Export encrypted UHD backup") {
+            passwordPrompt("Protect UHD backup", true) { password -> showBackupProgress("Encrypting UHD backup…"); io.execute {
+                val result = runCatching { api.vault.exportBackup(password) }; password.fill('\u0000')
+                main.post { if (!isDestroyed) { backupProgress?.dismiss(); backupProgress = null; result.fold({ bytes -> saveBackupToDownloads(bytes) }, { Toast.makeText(this, "Unable to export this identity", Toast.LENGTH_LONG).show() }) } }
+            } }
+        })
+        content.addView(button("Restore encrypted UHD backup") { chooseBackup() })
         if (api.vault.configured()) content.addView(button("Forget UHD identity") { AlertDialog.Builder(this).setMessage("Remove UHD setup from this app?").setPositiveButton("Forget") { _, _ -> api.vault.forget(); settings() }.setNegativeButton("Cancel", null).show() })
+        content.addView(button("Add live-channel cards to TV home") {
+            val busy = Toast.makeText(this, "Updating live-channel cards…", Toast.LENGTH_SHORT); busy.show()
+            io.execute { val result = runCatching { LiveHomeChannels.publish(this, api.channels()) }; main.post { if (!isDestroyed) result.fold({ id ->
+                LiveHomeChannels.requestVisible(this, id)
+                Toast.makeText(this, "Live-channel cards published. Visibility and placement depend on your TV launcher.", Toast.LENGTH_LONG).show()
+            }, { Toast.makeText(this, "The launcher could not accept the live-channel row.", Toast.LENGTH_LONG).show() }) } }
+        })
         content.addView(button("Captions on 10-second rewind: ${if (store.autoCaptions()) "On" else "Off"}") { store.autoCaptions(!store.autoCaptions()); settings() })
         content.addView(button("Android caption appearance settings") { runCatching { startActivity(Intent(android.provider.Settings.ACTION_CAPTIONING_SETTINGS)) }.onFailure { Toast.makeText(this, "Caption settings are unavailable on this device", Toast.LENGTH_LONG).show() } })
         content.addView(button("Licences and attribution") { val notice = listOf("NOTICE.md", "LICENSE.txt", "APACHE-2.0.txt").joinToString("\n\n") { assets.open(it).bufferedReader().use { reader -> reader.readText() } }; AlertDialog.Builder(this).setTitle("Licences and attribution").setMessage(notice).setPositiveButton("Close", null).show() })
