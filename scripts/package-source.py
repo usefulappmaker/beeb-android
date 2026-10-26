@@ -27,7 +27,7 @@ def main():
         if re.search(rb'-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----', data):
             raise SystemExit('Private key in ' + relative.as_posix())
         files.append((relative, data))
-    out = ROOT / 'dist/Beeb-Android-0.1.5-source.zip'
+    out = ROOT / 'dist/Beeb-Android-0.1.6-source.zip'
     out.parent.mkdir(exist_ok=True)
     with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as archive:
         for relative, data in files:

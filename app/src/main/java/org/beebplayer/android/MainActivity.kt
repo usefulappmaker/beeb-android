@@ -37,23 +37,12 @@ class MainActivity : ComponentActivity() {
             main.post { if (!isDestroyed) Toast.makeText(this, if (result.isSuccess) "Encrypted UHD backup saved. Keep its password separately." else "Unable to save backup", Toast.LENGTH_LONG).show() }
         } else bytes?.fill(0)
     }
-    private val restoreBackup = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) restoreFromUri(uri) }
-    private fun restoreFromUri(uri: android.net.Uri) {
-        io.execute {
-            val result = runCatching { contentResolver.openInputStream(uri)?.use { input ->
-                val output = java.io.ByteArrayOutputStream(); val buffer = ByteArray(4096)
-                while (output.size() <= IdentityBackup.MAX_BYTES) { val n = input.read(buffer); if (n < 0) break; output.write(buffer, 0, n) }
-                output.toByteArray().also { require(it.size <= IdentityBackup.MAX_BYTES) { "Backup is too large" } }
-            } ?: error("Unable to read backup") }
-            main.post { if (!isDestroyed) result.fold({ bytes -> passwordPrompt("Restore UHD backup", false) { password ->
-                showBackupProgress("Restoring UHD backup…")
-                io.execute { val restored = runCatching { api.vault.importBackup(bytes, password) }; password.fill('\u0000'); bytes.fill(0); main.post { if (!isDestroyed) { backupProgress?.dismiss(); backupProgress = null; settings(); Toast.makeText(this, if (restored.isSuccess) "UHD identity restored" else restored.exceptionOrNull()?.message ?: "Unable to restore backup", Toast.LENGTH_LONG).show() } } }
-            } }, { Toast.makeText(this, it.message ?: "Unable to read backup", Toast.LENGTH_LONG).show() }) }
-        }
-    }
     private var searchQuery = ""
     private var searchInput: EditText? = null
     private var searchUpdate: Runnable? = null
+    private val searchWorker = Executors.newSingleThreadExecutor()
+    private var searchTask: java.util.concurrent.Future<*>? = null
+    private var searchRevision = 0
     private var refreshingCatalogue = false
     private val catalogue by lazy { CatalogueIndex(this, api) }
     private val voiceSearch = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -132,7 +121,7 @@ class MainActivity : ComponentActivity() {
         if (android.os.Build.VERSION.SDK_INT >= 33) platformBack?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
         platformBack = null
         main.removeCallbacks(rotate); main.removeCallbacks(liveRefresh); super.onPause() }
-    override fun onDestroy() { directSetup?.cancel(); setupProgress?.dismiss(); episodePanel?.dismiss(); backupProgress?.dismiss(); generation++; io.shutdownNow(); super.onDestroy() }
+    override fun onDestroy() { directSetup?.cancel(); setupProgress?.dismiss(); episodePanel?.dismiss(); backupProgress?.dismiss(); generation++; searchRevision++; searchTask?.cancel(true); searchWorker.shutdownNow(); main.removeCallbacksAndMessages(null); io.shutdownNow(); super.onDestroy() }
     private fun navigateBack() { if (episodePanel?.isShowing == true) episodePanel?.dismiss() else if (backStack.isNotEmpty()) backStack.removeAt(backStack.lastIndex).invoke() else if (currentTab != "Home") { currentTab = "Home"; home() } else finish() }
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
     private fun label(text: String, size: Float = 22f, muted: Boolean = false) = TextView(this).apply { this.text = text; textSize = size; setTextColor(if (muted) 0xFFB6B2C0.toInt() else Color.WHITE); setPadding(0, dp(6), 0, dp(8)) }
@@ -155,7 +144,7 @@ class MainActivity : ComponentActivity() {
         }
     }
     private fun reset(title: String): Int {
-        generation++; searchInput = null; searchUpdate?.let(main::removeCallbacks); body.removeAllViews(); banner = null
+        generation++; searchRevision++; searchTask?.cancel(true); searchInput = null; searchUpdate?.let(main::removeCallbacks); body.removeAllViews(); banner = null
         updateTabs()
         pageHeader = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(0, 0, 0, dp(8)) }
         if (title != "Home") {
@@ -344,25 +333,37 @@ class MainActivity : ComponentActivity() {
         content.addView(bar)
         val status=label("",15f,true);content.addView(status)
         val results=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL };content.addView(results)
-        fun render() {
+        fun render(moveFocus: Boolean = false) {
             if(searchInput!==field) return
-            results.removeAllViews(); val previous=content;content=results
-            val matches=catalogue.search(searchQuery)
-            content.addView(label(if(searchQuery.isBlank()) "Find programmes by title or description" else "${matches.size} ${if(matches.size==1) "result" else "results"} for “$searchQuery”",18f,true))
-            var shown=0;lateinit var more: TextView
-            fun append() { results.removeView(more);val next=matches.drop(shown).take(30);shown+=next.size;val old=content;content=results;grid(next,::openShow);content=old;if(shown<matches.size)results.addView(more) }
-            more=discoveryText("More results  ›") { append() };append()
-            content=previous
+            val query=searchQuery; val revision=++searchRevision
+            searchTask?.cancel(true)
+            searchTask=searchWorker.submit {
+                val matches=try { catalogue.search(query) } catch (_: java.util.concurrent.CancellationException) { return@submit }
+                main.post {
+                    if(isDestroyed || searchInput!==field || revision!=searchRevision) return@post
+                    results.removeAllViews()
+                    results.addView(label(if(query.isBlank()) "Find programmes by title or description" else "${matches.size} ${if(matches.size==1) "result" else "results"} for “$query”",18f,true))
+                    var shown=0;lateinit var more: TextView
+                    fun append() {
+                        results.removeView(more); val next=matches.drop(shown).take(if(shown==0)9 else 30);shown+=next.size
+                        val previous=content;content=results
+                        try { grid(next,::openShow) } finally { content=previous }
+                        if(shown<matches.size)results.addView(more)
+                    }
+                    more=discoveryText("More results  ›") { append() };append()
+                    if(moveFocus) (0 until results.childCount).map {results.getChildAt(it)}.filterIsInstance<LinearLayout>().firstOrNull()?.getChildAt(0)?.requestFocus()
+                }
+            }
         }
         field.addTextChangedListener(object:android.text.TextWatcher {
             override fun beforeTextChanged(s:CharSequence?,start:Int,count:Int,after:Int)=Unit
-            override fun onTextChanged(s:CharSequence?,start:Int,before:Int,count:Int) { searchQuery=s.toString().take(200); searchUpdate?.let(main::removeCallbacks);searchUpdate=Runnable { render() };main.postDelayed(searchUpdate!!,250) }
+            override fun onTextChanged(s:CharSequence?,start:Int,before:Int,count:Int) { searchQuery=s.toString().take(200); searchRevision++; searchTask?.cancel(true); searchUpdate?.let(main::removeCallbacks);searchUpdate=Runnable { render() };main.postDelayed(searchUpdate!!,350) }
             override fun afterTextChanged(s:android.text.Editable?)=Unit
         })
         field.setOnEditorActionListener { _,action,event ->
             if(action==android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH || event?.keyCode==KeyEvent.KEYCODE_ENTER) {
                 (getSystemService(INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager).hideSoftInputFromWindow(field.windowToken,0)
-                render();val first=(0 until results.childCount).map { results.getChildAt(it) }.filterIsInstance<LinearLayout>().firstOrNull()?.getChildAt(0);first?.requestFocus();true
+                searchUpdate?.let(main::removeCallbacks);render(true);true
             } else false
         }
         content.addView(discoveryText("Refresh catalogue") { refreshCatalogue(status,true) { render() } })
@@ -447,28 +448,32 @@ class MainActivity : ComponentActivity() {
             clipToOutline = true
         }
         surface.addView(image(p.image, 390), LinearLayout.LayoutParams(0, -1, .40f))
-        val info = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(30), dp(24), dp(30), dp(24)); gravity = Gravity.CENTER_VERTICAL; clipChildren = false; clipToPadding = false }
-        info.addView(label(p.title, 14f, true).apply { setTextColor(pink); letterSpacing = .08f })
-        info.addView(label(p.subtitle.ifEmpty { p.title }, 28f).apply { maxLines = 2; setTypeface(null, Typeface.BOLD) })
+        val info = RelativeLayout(this).apply { setPadding(dp(30), dp(24), dp(30), dp(24)); clipChildren = true; clipToPadding = true }
+        val header = LinearLayout(this).apply { orientation=LinearLayout.VERTICAL; id=View.generateViewId() }
+        header.addView(label(p.title, 14f, true).apply { setTextColor(pink); letterSpacing = .08f; maxLines=1; ellipsize=android.text.TextUtils.TruncateAt.END })
+        header.addView(label(p.subtitle.ifEmpty { p.title }, 24f).apply { maxLines = 2; ellipsize=android.text.TextUtils.TruncateAt.END; setTypeface(null, Typeface.BOLD) })
         val date = runCatching { java.time.LocalDate.parse(p.date.take(10)).format(java.time.format.DateTimeFormatter.ofPattern("d MMM yyyy", java.util.Locale.UK)) }.getOrDefault(p.date.take(10))
         val meta = listOf(p.duration, date, if (p.uhd) { if (p.hdr) "4K HDR available" else "4K available" } else "").filter { it.isNotBlank() }.joinToString("   ·   ")
-        info.addView(label(meta, 13f, true))
+        header.addView(label(meta, 13f, true).apply { maxLines=1; ellipsize=android.text.TextUtils.TruncateAt.END })
+        info.addView(header,RelativeLayout.LayoutParams(-1,-2).apply { addRule(RelativeLayout.ALIGN_PARENT_TOP) })
         val description = label(p.summary, 16f).apply { setTextColor(0xFFD5D3DD.toInt()); setLineSpacing(dp(3).toFloat(), 1f) }
-        val descriptionScroll = ScrollView(this).apply { isFocusable = true; addView(description) }
-        info.addView(descriptionScroll, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(6); bottomMargin = dp(14) })
-        val actions = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; clipChildren = false; clipToPadding = false }
+        val descriptionScroll = ScrollView(this).apply { id=View.generateViewId(); contentDescription="Programme description"; isFocusable = true; isFillViewport=false; clipChildren=true; clipToPadding=true; isVerticalScrollBarEnabled=true; addView(description) }
+        val actions = LinearLayout(this).apply { id=View.generateViewId(); gravity = Gravity.CENTER_VERTICAL; clipChildren = false; clipToPadding = false }
         val playButton = ImageButton(this).apply {
             setImageResource(R.drawable.beeb_mark); scaleType = ImageView.ScaleType.FIT_CENTER
             setPadding(dp(22), dp(13), dp(22), dp(13)); contentDescription = if (store.resume(p) > 0) "Resume" else "Play"
             isFocusable = true; isFocusableInTouchMode = true
             fun appearance(on: Boolean) = GradientDrawable().apply { cornerRadius = dp(28).toFloat(); setColor(if (on) Color.WHITE else 0xFFE3DFE7.toInt()) }
             background = appearance(false)
-            setOnFocusChangeListener { _, on -> background = appearance(on); animate().scaleX(if (on) 1.07f else 1f).scaleY(if (on) 1.07f else 1f).setDuration(120).start() }
+            setOnFocusChangeListener { _, on -> background = appearance(on) }
             setOnClickListener { dialog.dismiss(); play(p, next, false) }
         }
         actions.addView(playButton, LinearLayout.LayoutParams(dp(90), dp(54)))
         if (store.resume(p) > 0) actions.addView(button("Start over") { dialog.dismiss(); play(p, next, true) }, LinearLayout.LayoutParams(-2, dp(54)).apply { marginStart = dp(16) })
-        info.addView(actions)
+        info.addView(actions,RelativeLayout.LayoutParams(-1,dp(58)).apply { addRule(RelativeLayout.ALIGN_PARENT_BOTTOM) })
+        info.addView(descriptionScroll,RelativeLayout.LayoutParams(-1,-1).apply { addRule(RelativeLayout.BELOW,header.id); addRule(RelativeLayout.ABOVE,actions.id); topMargin=dp(6); bottomMargin=dp(16) })
+        playButton.nextFocusUpId=descriptionScroll.id
+        descriptionScroll.nextFocusDownId=playButton.id.takeIf {it!=View.NO_ID} ?: View.generateViewId().also {playButton.id=it}
         surface.addView(info, LinearLayout.LayoutParams(0, -1, .60f))
         dialog.setContentView(surface)
         dialog.window?.apply {
@@ -507,24 +512,6 @@ class MainActivity : ComponentActivity() {
             }
             bytes.fill(0)
             main.post { if (!isDestroyed) { backupProgress?.dismiss(); backupProgress = null; Toast.makeText(this, if (result.isSuccess) "Encrypted backup saved in Downloads/Beeb. Copy it to your computer and keep the password separately." else "Unable to save backup to Downloads", Toast.LENGTH_LONG).show() } }
-        }
-    }
-    private fun chooseBackup() {
-        io.execute {
-            val choices = mutableListOf<Pair<String, android.net.Uri>>()
-            if (android.os.Build.VERSION.SDK_INT >= 29) runCatching {
-                val collection = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
-                contentResolver.query(collection, arrayOf(android.provider.MediaStore.Downloads._ID, android.provider.MediaStore.Downloads.DISPLAY_NAME), "${android.provider.MediaStore.Downloads.RELATIVE_PATH} = ?", arrayOf("Download/Beeb/"), "${android.provider.MediaStore.Downloads._ID} DESC")?.use { cursor ->
-                    while (cursor.moveToNext() && choices.size < 30) {
-                        val name = cursor.getString(1)
-                        if (name.startsWith("Beeb-UHD-") && name.endsWith(".beeb")) choices += name to android.content.ContentUris.withAppendedId(collection, cursor.getLong(0))
-                    }
-                }
-            }
-            main.post { if (!isDestroyed) AlertDialog.Builder(this).setTitle("Restore encrypted UHD backup").setItems((choices.map { it.first } + "Choose another file…").toTypedArray()) { _, index ->
-                if (index < choices.size) restoreFromUri(choices[index].second)
-                else runCatching { restoreBackup.launch(arrayOf("*/*")) }.onFailure { Toast.makeText(this, "A file picker is not available on this TV. Reconnect with the computer helper instead.", Toast.LENGTH_LONG).show() }
-            }.setNegativeButton("Cancel", null).show() }
         }
     }
     private fun showBackupProgress(title: String) {
@@ -569,30 +556,32 @@ class MainActivity : ComponentActivity() {
         returnScreen = { settings() }
         reset("Settings")
         content.addView(label("Beeb for Android TV · ${BuildConfig.VERSION_NAME}", 22f))
-        content.addView(label("4K HLG · TwinVine", 26f)); content.addView(label(api.vault.status(), 19f, true))
-        content.addView(label("Enable 4K playback directly on this TV. Beeb downloads the UHD configuration, validates it and checks BBC access before saving it securely. No computer or helper is needed.",18f,true))
-        content.addView(button("Enable BBC UHD") { enableDirectUhd() })
-        content.addView(label("Normal updates keep the saved identity on this TV. A password-protected backup can also restore it after clearing storage, reinstalling or changing devices. Save that backup somewhere you control and keep its password separately.", 17f, true))
-        if (api.vault.configured()) content.addView(button("Export encrypted UHD backup") {
+        content.addView(label("4K UHD playback", 24f)); content.addView(label(api.vault.status(), 19f, true))
+        content.addView(label("Automatically configure UHD playback on this TV. No computer required.",18f,true))
+        content.addView(discoveryText("Enable BBC UHD") { enableDirectUhd() })
+        content.addView(label(UhdSupport.inspect(this).description, 17f, true))
+        if (api.vault.configured()) content.addView(discoveryText("Export encrypted UHD backup") {
             passwordPrompt("Protect UHD backup", true) { password -> showBackupProgress("Encrypting UHD backup…"); io.execute {
                 val result = runCatching { api.vault.exportBackup(password) }; password.fill('\u0000')
                 main.post { if (!isDestroyed) { backupProgress?.dismiss(); backupProgress = null; result.fold({ bytes -> saveBackupToDownloads(bytes) }, { Toast.makeText(this, "Unable to export this identity", Toast.LENGTH_LONG).show() }) } }
             } }
         })
-        content.addView(button("Restore encrypted UHD backup") { chooseBackup() })
-        if (api.vault.configured()) content.addView(button("Forget UHD identity") { AlertDialog.Builder(this).setMessage("Remove UHD setup from this app?").setPositiveButton("Forget") { _, _ -> api.vault.forget(); settings() }.setNegativeButton("Cancel", null).show() })
-        content.addView(button("Add live-channel cards to TV home") {
+        if (api.vault.configured()) content.addView(discoveryText("Forget UHD identity") { AlertDialog.Builder(this).setMessage("Remove UHD setup from this app?").setPositiveButton("Forget") { _, _ -> api.vault.forget(); settings() }.setNegativeButton("Cancel", null).show() })
+        content.addView(label("TV home", 22f))
+        content.addView(discoveryText("Add live-channel cards to TV home") {
             val busy = Toast.makeText(this, "Updating live-channel cards…", Toast.LENGTH_SHORT); busy.show()
             io.execute { val result = runCatching { LiveHomeChannels.publish(this, api.channels()) }; main.post { if (!isDestroyed) result.fold({ id ->
                 LiveHomeChannels.requestVisible(this, id)
                 Toast.makeText(this, "Live-channel cards published. Visibility and placement depend on your TV launcher.", Toast.LENGTH_LONG).show()
             }, { Toast.makeText(this, "The launcher could not accept the live-channel row.", Toast.LENGTH_LONG).show() }) } }
         })
-        content.addView(button("Captions on 10-second rewind: ${if (store.autoCaptions()) "On" else "Off"}") { store.autoCaptions(!store.autoCaptions()); settings() })
-        content.addView(button("Android caption appearance settings") { runCatching { startActivity(Intent(android.provider.Settings.ACTION_CAPTIONING_SETTINGS)) }.onFailure { Toast.makeText(this, "Caption settings are unavailable on this device", Toast.LENGTH_LONG).show() } })
-        content.addView(button("Licences and attribution") { val notice = listOf("NOTICE.md", "LICENSE.txt", "APACHE-2.0.txt").joinToString("\n\n") { assets.open(it).bufferedReader().use { reader -> reader.readText() } }; AlertDialog.Builder(this).setTitle("Licences and attribution").setMessage(notice).setPositiveButton("Close", null).show() })
-        content.addView(button("Open BBC episode URL / ID") { val field = EditText(this); AlertDialog.Builder(this).setTitle("BBC episode URL or ID").setView(field).setPositiveButton("Open") { _, _ -> load("Episode", { api.episode(Parsing.pid(field.text.toString())) }) { episode(it, null) } }.setNegativeButton("Cancel", null).show() })
-        content.addView(label("Independent player · GPL-3.0-or-later\nNo BBC account sync or offline downloads. UHD needs compatible content, decoder and HLG display. Keep setup links and private keys out of screenshots and bug reports.", 17f, true))
+        content.addView(label("Subtitles", 22f))
+        content.addView(discoveryText("Captions on 10-second rewind: ${if (store.autoCaptions()) "On" else "Off"}") {
+            store.autoCaptions(!store.autoCaptions())
+            (content.findFocus() as? TextView)?.text="Captions on 10-second rewind: ${if(store.autoCaptions()) "On" else "Off"}"
+        })
+        content.addView(discoveryText("Android caption appearance settings") { runCatching { startActivity(Intent(android.provider.Settings.ACTION_CAPTIONING_SETTINGS)) }.onFailure { Toast.makeText(this, "Caption settings are unavailable on this device", Toast.LENGTH_LONG).show() } })
+        content.addView(label("Independent BBC player · GPL-3.0-or-later", 17f, true))
     }
 }
 

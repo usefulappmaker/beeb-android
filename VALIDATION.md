@@ -1,3 +1,17 @@
+# Android TV 0.1.6 validation
+
+- Signed release APK and debug APK assembled successfully; release and debug Android lint passed.
+- 19 JVM tests passed, including live playlist clocks/discontinuities, MPEG-TS PTS wrap, fragmented TTML conversion, native-rendition generation, search ranking/cancellation and the existing identity/playback tests.
+- Three final Android emulator checks passed: responsive typing while catalogue refresh is active; clipped/scrollable long descriptions with a separate Play area and requested Settings removals; live updates to Android caption font scale and foreground colour; and real BBC live TTML fragments decoded into timed cues by Media3’s native WebVTT parser.
+- Screenshots were inspected. The long-description screenshot intentionally uses an oversized synthetic synopsis with no artwork to stress scrolling; it is a regression fixture, not a real film playback capture.
+- Live BBC playback exposed a selectable English track. A preliminary run delivered native caption cues. Subsequent full-video checks failed with decoder initialisation/timeouts in this emulator, so end-to-end live A/V/caption synchronisation is not marked passed. The final service/parser check verifies actual downloaded BBC text and timestamp mappings without claiming television output.
+- Live now uses the default live-edge position rather than an explicit VOD resume position of zero.
+- No physical Shield was available. The capability report explains Android’s reported HLG and HEVC Main 10 support; it does not prove the cause on an individual Shield/display/receiver chain. Physical 4K/HDR output for this build remains unverified.
+- Signing key/application ID and saved-identity format are unchanged. No real identity was replaced, exported or deleted while testing this update.
+- The signed release APK was installed in place over 0.1.5 on a physical Chromecast with Google TV and launched successfully. Version 0.1.6 / code 7 was verified and the original first-install timestamp was retained. This verifies update/launch, not every playback fix on the device.
+
+## Historical validation
+
 # Android 0.1.5 validation
 
 ## Playback lookup and on-device UHD setup

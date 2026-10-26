@@ -1,6 +1,6 @@
 # Enable BBC UHD on Android TV
 
-Install Beeb 0.1.5 or later and open **Settings → Enable BBC UHD**. No Mac application, Python installation, helper or copied setup URL is needed.
+Install Beeb 0.1.6 or later and open **Settings → Enable BBC UHD**. No Mac application, Python installation, helper or copied setup URL is needed.
 
 1. Select **Enable BBC UHD**. Beeb automatically retrieves the current UHD configuration over HTTPS.
 2. The TV validates the configuration, certificate dates and matching RSA private key. It creates the import container in memory and checks BBC access with the candidate identity.
@@ -15,7 +15,7 @@ Install signed updates over the existing application. Keep the same application 
 
 Use **Settings → Export encrypted UHD backup**, choosing a password of at least 12 characters. On Android 10+, the backup is saved in **Downloads/Beeb**; copy it somewhere you control and keep the password separately. Older Android versions use the system file picker.
 
-Use **Settings → Restore encrypted UHD backup** to choose an app-owned backup or another file. File-picker availability varies on TV devices. If the file is inaccessible, use **Enable BBC UHD** to set up the TV again. The portable backup can restore after reinstalling or changing devices; the internal recovery copy cannot recover a deleted Android Keystore key. Existing identities imported through the older Mac helper remain compatible.
+The backup restore action has been removed from Settings in 0.1.6. Use **Enable BBC UHD** to configure the TV again after reinstalling or clearing storage. Existing saved identities remain compatible with in-place updates.
 
 ## Requirements
 

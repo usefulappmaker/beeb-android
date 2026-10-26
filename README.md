@@ -1,4 +1,4 @@
-# Beeb for Android TV — 0.1.5
+# Beeb for Android TV — 0.1.6
 
 An independent native BBC player for Android TV and Google TV. Android 8.0 (API 26) or later. Beeb is not affiliated with or endorsed by the BBC.
 
@@ -16,11 +16,22 @@ An independent native BBC player for Android TV and Google TV. Android 8.0 (API 
 
 ## Download and install
 
-**[Download Beeb for Android TV 0.1.5](https://github.com/usefulappmaker/beeb-android/releases/tag/v0.1.5)** — signed APK, source and release notes.
+**[Download Beeb for Android TV 0.1.6 — Hotfix](https://github.com/usefulappmaker/beeb-android/releases/tag/v0.1.6)** — signed APK, source and release notes.
 
-![Changes since 0.1.1](docs/Beeb-Android-0.1.5-changes.png)
+Installed as an in-place update and launched successfully on a **Chromecast with Google TV**. Full testing details and remaining device checks are in [VALIDATION.md](VALIDATION.md).
 
-### New in 0.1.5
+### New in 0.1.6 — Hotfix
+
+- **Live TV subtitles:** added a selectable English subtitle track where BBC captions are available.
+- **Native caption appearance:** Android caption settings now control subtitle size, font and colours.
+- **Search:** moved catalogue searching into the background to prevent freezing while typing.
+- **Episode descriptions:** long descriptions scroll within a shorter area, keeping the Play button clear.
+- **UHD compatibility:** Settings and playback quality details explain device limitations that can cause Full HD fallback.
+
+
+### Changes in 0.1.5
+
+![Changes in 0.1.5](docs/Beeb-Android-0.1.5-changes.png)
 
 - Refreshed navigation, programme cards, episode panels and bookmark controls.
 - Full-catalogue Search with the native TV keyboard and system voice input.
@@ -31,7 +42,7 @@ An independent native BBC player for Android TV and Google TV. Android 8.0 (API 
 
 See the [full release notes](CHANGELOG.md).
 
-Use the supplied `Beeb-Android-0.1.5.apk`. You do not need Android Studio or a Google Play developer account to install an APK on a device that permits sideloading.
+Use the supplied `Beeb-Android-0.1.6.apk`. You do not need Android Studio or a Google Play developer account to install an APK on a device that permits sideloading.
 
 1. Transfer the APK to your Android TV/Google TV using your chosen local file-transfer method, or use ADB below.
 2. If using a file manager, enable “Install unknown apps” for that installer when Android asks. Only approve an APK you intend to install. Device/vendor restrictions vary.
@@ -42,7 +53,7 @@ ADB installation, after enabling and authorising your device's USB/network debug
 
 ```sh
 adb devices
-adb install -r Beeb-Android-0.1.5.apk
+adb install -r Beeb-Android-0.1.6.apk
 adb shell am start -n org.beebplayer.android/.MainActivity
 ```
 
@@ -114,3 +125,15 @@ Select the search field to use the installed Android TV keyboard. The microphone
 Season selectors display the generic “Episodes” group as **Specials**, while all named seasons retain their original names and grouping.
 
 Playback version discovery uses BBC’s current episode API for both HD and UHD. It matches the requested episode, excludes expired/future, signed and audio-described versions, and prioritises available UHD versions. The obsolete programme playlist endpoint is no longer used.
+
+## Live subtitles and caption appearance
+
+Where BBC supplies live captions, the player’s standard subtitle menu offers **English**. Beeb maps BBC’s numbered TTML fragments to the live video clock and exposes a rolling WebVTT rendition to Media3. Video and audio are streamed directly without transcoding. Caption fragments are requested as needed, including within the available rewind window. Temporary gaps in BBC captions can leave a quiet interval; some channels/programmes do not supply captions.
+
+Android’s caption appearance settings control colour, background, typeface and relative size. Beeb ignores the BBC file’s embedded colours/font sizes, and applies changes while the player is open or after returning from system Settings. Manual subtitle selection remains in the standard player menu; the existing temporary-captions-on-rewind behaviour is retained.
+
+## Full HD on a UHD programme
+
+A catalogue UHD badge means availability, not a guarantee that every device can decode and output that version. BBC UHD requires **HEVC Main 10 and HLG**. HDR10 and Dolby Vision support alone do not establish HLG support. Settings and the player’s received-quality details explain the capability gate reported by Android. Network conditions, available episode versions and decoder errors can also lead to HD playback.
+
+NVIDIA’s [Shield specifications](https://www.nvidia.com/en-eu/shield/shield-tv/) list HEVC 4K, HDR10 and Dolby Vision. Do not assume HLG compatibility from those specifications. Android recommends [checking the reported HLG display capability](https://developer.android.com/media/grow/hdr-playback). A Shield/display/receiver setup needs its own capability report to confirm the cause. Beeb retains the compatible HD fallback; it does not relabel HLG as HDR10 or convert colour formats.

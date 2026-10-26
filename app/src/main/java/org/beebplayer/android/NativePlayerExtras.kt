@@ -82,7 +82,7 @@ class NativePlayerExtras(context: Context, private val player: ExoPlayer, privat
     private fun qualityDialog() {
         val f = player.videoFormat ?: return
         val range = when (f.colorInfo?.colorTransfer) { C.COLOR_TRANSFER_HLG -> "HLG"; C.COLOR_TRANSFER_ST2084 -> "HDR10"; else -> "SDR / unspecified" }
-        present(AlertDialog.Builder(context).setTitle("Received stream").setMessage("${f.width} × ${f.height}\n${f.codecs ?: f.sampleMimeType.orEmpty()}\nHDR: $range\n\nCheck the TV's HDR status for its output mode.").setPositiveButton("Close", null).create())
+        present(AlertDialog.Builder(context).setTitle("Received stream").setMessage("${f.width} × ${f.height}\n${f.codecs ?: f.sampleMimeType.orEmpty()}\nHDR: $range\n\n${UhdSupport.inspect(context).description}\n\nCheck the TV's HDR status for its output mode.").setPositiveButton("Close", null).create())
     }
     internal fun debugDialogShowing(): Boolean { check(BuildConfig.DEBUG); return dialog?.isShowing == true }
     internal fun debugDismissDialog() { check(BuildConfig.DEBUG); dialog?.dismiss() }

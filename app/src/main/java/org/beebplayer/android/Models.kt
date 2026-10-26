@@ -42,7 +42,7 @@ data class Skip(val title: String, val startMs: Long, val endMs: Long) {
         }
     }
 }
-data class Stream(val url: String, val version: String = "", val uhd: Boolean = false, val caption: String = "", val skips: List<Skip> = emptyList())
+data class Stream(val url: String, val version: String = "", val uhd: Boolean = false, val caption: String = "", val skips: List<Skip> = emptyList(), val liveCaptions: LiveCaptionResources? = null)
 data class Variant(val url: String, val height: Int, val bandwidth: Long)
 
 object Parsing {

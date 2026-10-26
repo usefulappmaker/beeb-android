@@ -24,6 +24,20 @@ class BbcApi(private val context: Context) {
             return response.body?.string() ?: error("Empty service response")
         }
     }
+    private fun bytes(url: String, limit: Int): ByteArray {
+        require(url.startsWith("https://"))
+        if (Thread.currentThread().isInterrupted) throw java.io.InterruptedIOException()
+        http.newBuilder().callTimeout(6, TimeUnit.SECONDS).build().newCall(Request.Builder().url(url).build()).execute().use { r ->
+            check(r.isSuccessful) { "Caption service unavailable" }
+            val body = r.body ?: error("Empty caption response")
+            require(body.contentLength() <= limit)
+            body.byteStream().use { input ->
+                val out = java.io.ByteArrayOutputStream(); val buffer = ByteArray(8192)
+                while(true) { val n=input.read(buffer); if(n<0)break; require(out.size()+n<=limit); out.write(buffer,0,n) }
+                return out.toByteArray()
+            }
+        }
+    }
     private fun json(url: String) = JSONObject(get(url))
     fun home(): Home {
         val file = context.cacheDir.resolve("home-v1.json")
@@ -86,11 +100,15 @@ class BbcApi(private val context: Context) {
         var fallback: Variant? = null
         for (api in listOf(6, 5)) for (set in listOf("iptv-all", "pc")) {
             try {
-                val masters = selector(listing(version, set, api), "video")
+                val xml = listing(version, set, api)
+                val masters = selector(xml, "video")
                 for (master in masters) {
                     try {
                         val text = get(master); if (!text.startsWith("#EXTM3U")) continue
-                        if (live) return Stream(master)
+                        if (live) {
+                            val captions = runCatching { LiveCaptionResources.create(text, master, selector(xml,"captions").filter { it.contains("\$Number\$") }, ::bytes) }.getOrNull()
+                            return Stream(captions?.masterUrl ?: master, liveCaptions = captions)
+                        }
                         val variants = Parsing.variants(text, master).filter { it.height < 2160 }
                         val best = variants.firstOrNull { it.height >= 1080 }
                         if (best != null && get(best.url).startsWith("#EXTM3U")) return Stream(best.url, version)

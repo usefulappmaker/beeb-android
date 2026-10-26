@@ -18,3 +18,5 @@ __pycache__/
 .env*
 *pairing-url*
 *setup-url*
+
+dist/

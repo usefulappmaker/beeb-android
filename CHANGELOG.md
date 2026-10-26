@@ -1,3 +1,25 @@
+# Beeb for Android TV 0.1.6 — Hotfix
+
+Fixes for subtitles, search and the Android TV interface.
+
+- **Live TV subtitles:** added a selectable English subtitle track where BBC captions are available.
+- **Native caption appearance:** Android caption settings now control subtitle size, font and colours.
+- **Search:** moved catalogue searching into the background to prevent freezing while typing.
+- **Episode descriptions:** long descriptions scroll within a shorter area, keeping the Play button clear.
+- **UHD compatibility:** Settings and playback quality details explain device limitations that can cause Full HD fallback.
+
+### Testing
+
+Installed successfully over the previous version and launched on a **Chromecast with Google TV**, retaining existing app data.
+
+Build checks, Android lint, 19 unit tests and three emulator checks passed, including Android caption preferences, search, description layout and real BBC captions decoded through Media3.
+
+### Updating
+
+Install **Beeb-Android-0.1.6.apk** over your existing installation to retain saved programmes and UHD setup.
+
+---
+
 # Beeb for Android TV 0.1.5
 
 A refreshed Android TV experience, with native search, a dedicated 4K UHD collection, more reliable playback and UHD setup directly on your TV.

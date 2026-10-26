@@ -2,7 +2,7 @@ plugins { id("com.android.application") }
 android {
     namespace = "org.beebplayer.android"
     compileSdk = 37
-    defaultConfig { applicationId = "org.beebplayer.android"; minSdk = 26; targetSdk = 36; resValue("string", "app_name", "Beeb"); versionCode = 6; versionName = "0.1.5"; testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner" }
+    defaultConfig { applicationId = "org.beebplayer.android"; minSdk = 26; targetSdk = 36; resValue("string", "app_name", "Beeb"); versionCode = 7; versionName = "0.1.6"; testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner" }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     buildFeatures { buildConfig = true; resValues = true }
     val keyPath = providers.environmentVariable("BEEB_KEYSTORE_PATH").orNull

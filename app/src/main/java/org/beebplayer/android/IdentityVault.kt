@@ -30,7 +30,7 @@ class IdentityVault(context: Context) {
     private fun key(create: Boolean = false): SecretKey {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (store.getKey(alias, null) as? SecretKey)?.let { return it }
-        check(create) { "The saved UHD wrapping key is unavailable. Restore a backup or reconnect TwinVine." }
+        check(create) { "The saved UHD wrapping key is unavailable. Use Enable BBC UHD to configure playback again." }
         return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").apply {
             init(KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT).setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).setRandomizedEncryptionRequired(true).build())
         }.generateKey()
@@ -66,7 +66,7 @@ class IdentityVault(context: Context) {
         atomicWrite(file, bytes); atomicWrite(recovery, bytes)
     }
     fun configured() = runCatching { read(); true }.getOrDefault(false)
-    fun status(): String = if (configured()) "UHD identity connected · saved on this TV" else if (file.exists() || recovery.exists()) "Saved UHD identity cannot be unlocked. Restore a backup or reconnect TwinVine; the existing files have been preserved." else "No UHD identity saved. Enable BBC UHD or restore your encrypted backup."
+    fun status(): String = if (configured()) "UHD identity connected · saved on this TV" else if (file.exists() || recovery.exists()) "Saved UHD identity cannot be unlocked. Use Enable BBC UHD to configure playback again; the existing files have been preserved." else "No UHD setup saved. Select Enable BBC UHD to get started."
     @Synchronized fun forget() {
         android.util.AtomicFile(file).delete(); android.util.AtomicFile(recovery).delete()
         file.resolveSibling("uhd-identity.tmp").delete()

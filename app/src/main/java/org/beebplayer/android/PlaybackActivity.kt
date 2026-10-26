@@ -19,6 +19,7 @@ import android.widget.*
 import androidx.annotation.OptIn
 import androidx.media3.common.*
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
@@ -49,6 +50,12 @@ class PlaybackActivity : ComponentActivity() {
     private var temporaryUntil = -1L
     private var originalTextParameters: androidx.media3.common.TrackSelectionParameters? = null
     private var settingTemporaryCaptions = false
+    private lateinit var captionManager: android.view.accessibility.CaptioningManager
+    private val captionListener = object : android.view.accessibility.CaptioningManager.CaptioningChangeListener() {
+        override fun onUserStyleChanged(userStyle: android.view.accessibility.CaptioningManager.CaptionStyle) = applyCaptionAppearance()
+        override fun onFontScaleChanged(fontScale: Float) = applyCaptionAppearance()
+        override fun onEnabledChanged(enabled: Boolean) = applyCaptionAppearance()
+    }
     private var captionSamples = 0
     private var playerFailure = ""
     private var failureDetail = ""
@@ -85,6 +92,9 @@ class PlaybackActivity : ComponentActivity() {
         status = text("Finding the best available stream…", 20f).apply { setBackgroundColor(0xCC101016.toInt()); maxWidth = dp(650) }
         root.addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
         setContentView(root)
+        captionManager = getSystemService(CAPTIONING_SERVICE) as android.view.accessibility.CaptioningManager
+        captionManager.addCaptioningChangeListener(captionListener)
+        applyCaptionAppearance()
         // Keep the standard Media3 rewind button while retaining temporary captions on rewind.
         (view.findViewById<View>(androidx.media3.ui.R.id.exo_rew_with_amount)
             ?: view.findViewById<View>(androidx.media3.ui.R.id.exo_rew))?.setOnClickListener { rewind() }
@@ -112,7 +122,8 @@ class PlaybackActivity : ComponentActivity() {
                 diagnostic("error-${error.errorCodeName}")
             }
         })
-        resolve(true); main.post(tick)
+        if (!(BuildConfig.DEBUG && intent.getBooleanExtra("testNoPlayback", false))) resolve(true)
+        main.post(tick)
         if (next == null && episode != null) {
             val current = episode!!
             io.execute {
@@ -135,7 +146,7 @@ class PlaybackActivity : ComponentActivity() {
     private fun prepare(stream: Stream) {
         playerFailure = ""
         source = stream
-        val base = android.net.Uri.parse(stream.url)
+        val base = android.net.Uri.parse(stream.liveCaptions?.authorisationUrl ?: stream.url)
         val data = ResolvingDataSource.Factory(OkHttpDataSource.Factory(api.http)) { spec ->
             // Preserve same-host manifest authorisation on relative segment/playlist requests.
             if (spec.uri.host == base.host && !base.encodedQuery.isNullOrEmpty() && spec.uri.encodedQuery.isNullOrEmpty()) spec.withUri(spec.uri.buildUpon().encodedQuery(base.encodedQuery).build()) else spec
@@ -144,20 +155,30 @@ class PlaybackActivity : ComponentActivity() {
         if (stream.uhd) builder.setMimeType(MimeTypes.APPLICATION_MPD)
         if (stream.caption.isNotEmpty()) builder.setSubtitleConfigurations(listOf(MediaItem.SubtitleConfiguration.Builder(android.net.Uri.parse(stream.caption)).setMimeType(MimeTypes.APPLICATION_TTML).setLanguage("en").setLabel("English").build()))
         val media = builder.build()
-        val factory = DefaultMediaSourceFactory(DefaultDataSource.Factory(this, data))
-        player.setMediaSource(factory.createMediaSource(media), resume)
+        val upstream: DataSource.Factory = stream.liveCaptions?.let { captions -> DataSource.Factory { LiveCaptionDataSource(data.createDataSource(), captions) } } ?: data
+        val factory = DefaultMediaSourceFactory(DefaultDataSource.Factory(this, upstream))
+        // Live starts at the live edge. Passing the VOD resume value (zero) seeks into the DVR window.
+        val startPosition = if (episode == null && !(BuildConfig.DEBUG && intent.hasExtra("testStream"))) C.TIME_UNSET else resume
+        player.setMediaSource(factory.createMediaSource(media), startPosition)
         player.prepare(); player.playWhenReady = true
         val manager = getSystemService(CAPTIONING_SERVICE) as android.view.accessibility.CaptioningManager
-        view.subtitleView?.setUserDefaultStyle(); view.subtitleView?.setUserDefaultTextSize()
+        applyCaptionAppearance()
         if (manager.isEnabled) player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().setPreferredTextLanguage(manager.locale?.language ?: "en").setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false).build()
         else player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build()
         extras.play.requestFocus(); extras.show()
     }
-    private fun supportsUhd(): Boolean = runCatching {
-        val display = getSystemService(android.hardware.display.DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)
-        val hdr = display?.hdrCapabilities?.supportedHdrTypes?.contains(Display.HdrCapabilities.HDR_TYPE_HLG) == true
-        hdr && MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.any { codec -> !codec.isEncoder && codec.supportedTypes.any { it.equals("video/hevc", true) } && codec.getCapabilitiesForType("video/hevc").profileLevels.any { it.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10 || it.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10 } }
-    }.getOrDefault(false)
+    private fun applyCaptionAppearance() {
+        if (!::view.isInitialized || !::captionManager.isInitialized) return
+        view.subtitleView?.apply {
+            // BBC TTML can set its own colours and size; let the system caption preferences win.
+            setApplyEmbeddedStyles(false)
+            setApplyEmbeddedFontSizes(false)
+            setStyle(CaptionStyleCompat.createFromCaptionStyle(captionManager.userStyle))
+            setFractionalTextSize(.040f * captionManager.fontScale)
+        }
+    }
+    override fun onResume() { super.onResume(); applyCaptionAppearance() }
+    private fun supportsUhd(): Boolean = UhdSupport.inspect(this).supported
     private fun badge() { extras.update(currentSkip, next) }
     private fun playNext() {
         val upcoming = next ?: return
@@ -182,7 +203,7 @@ class PlaybackActivity : ComponentActivity() {
     private fun save() { episode?.let { store.update(it, next, player.currentPosition, player.duration) } }
     override fun onSaveInstanceState(outState: Bundle) { outState.putLong("position", player.currentPosition); super.onSaveInstanceState(outState) }
     override fun onPause() { if (::player.isInitialized) { save(); player.pause() }; super.onPause() }
-    override fun onDestroy() { alive = false; main.removeCallbacksAndMessages(null); io.shutdownNow(); extras.dispose(); player.release(); super.onDestroy() }
+    override fun onDestroy() { alive = false; main.removeCallbacksAndMessages(null); io.shutdownNow(); captionManager.removeCaptioningChangeListener(captionListener); extras.dispose(); player.release(); super.onDestroy() }
     private fun handlePlaybackKey(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN) {
             when (event.keyCode) {
@@ -211,7 +232,7 @@ class PlaybackActivity : ComponentActivity() {
     }
     internal fun debugSnapshot(): JSONObject {
         check(BuildConfig.DEBUG)
-        return JSONObject().put("positionMs", player.currentPosition).put("height", player.videoFormat?.height ?: 0).put("playing", player.isPlaying).put("subtitleTrackCount", player.currentTracks.groups.count { it.type == C.TRACK_TYPE_TEXT }).put("quality", extras.quality.text).put("controlsVisible", extras.visible).put("playLabel", extras.play.contentDescription).put("captionSamples", captionSamples).put("captionsEnabled", !player.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)).put("failure", playerFailure).put("failureDetail", failureDetail)
+        return JSONObject().put("positionMs", player.currentPosition).put("height", player.videoFormat?.height ?: 0).put("playing", player.isPlaying).put("subtitleTrackCount", player.currentTracks.groups.count { it.type == C.TRACK_TYPE_TEXT }).put("quality", extras.quality.text).put("controlsVisible", extras.visible).put("playLabel", extras.play.contentDescription).put("captionSamples", captionSamples).put("captionsEnabled", !player.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)).put("captionFontScale", captionManager.fontScale).put("liveCaptionBridge", source?.liveCaptions != null).put("liveCaptionStatus", source?.liveCaptions?.debugSummary.orEmpty()).put("nativeTextSelected", player.currentTracks.groups.any { it.type == C.TRACK_TYPE_TEXT && it.isSelected }).put("failure", playerFailure).put("failureDetail", failureDetail)
     }
     internal fun debugRewindCheck() {
         check(BuildConfig.DEBUG); restoreCaptions()

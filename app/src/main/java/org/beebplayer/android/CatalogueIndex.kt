@@ -19,12 +19,18 @@ class CatalogueIndex(context: Context, private val api: BbcApi) {
     init { knownUhd.addAll(items.filter { it.uhd }.map { it.id }) }
     fun needsRefresh() = System.currentTimeMillis()-updated > 24*60*60_000L
     fun allUhd() = items.filter { it.uhd }.sortedBy { normal(it.title) }
-    fun search(query: String): List<Programme> {
-        val needle=normal(query.trim()); if(needle.isEmpty()) return emptyList()
-        val words=needle.split(Regex("\\s+"))
-        return items.filter { p -> val text=normal(p.title+" "+p.summary); words.all(text::contains) }
-            .sortedWith(compareBy<Programme> { val t=normal(it.title); when { t==needle -> 0; t.startsWith(needle) -> 1; t.contains(needle) -> 2; else -> 3 } }.thenBy { normal(it.title) })
+    @Volatile private var searchSource: List<Programme>? = null
+    @Volatile private var searchEntries = emptyList<CatalogueSearch.Entry>()
+    private val searchLock = Any()
+    private fun indexed(): List<CatalogueSearch.Entry> = synchronized(searchLock) {
+        val current=items
+        if(searchSource !== current) {
+            val next=CatalogueSearch.index(current)
+            searchEntries=next; searchSource=current
+        }
+        searchEntries
     }
+    fun search(query: String): List<Programme> = CatalogueSearch.search(indexed(), query)
     @Synchronized fun discover(show: Programme, episodes: List<Programme>) {
         if(episodes.none { it.uhd }) return
         knownUhd.add(show.id)
@@ -59,5 +65,5 @@ class CatalogueIndex(context: Context, private val api: BbcApi) {
         val out=file.startWrite()
         try { out.write(bytes); file.finishWrite(out) } catch(e: Exception) { file.failWrite(out); throw e }
     }
-    companion object { fun normal(s: String)=Normalizer.normalize(s,Normalizer.Form.NFD).replace(Regex("\\p{M}+"),"").lowercase(Locale.ROOT) }
+    companion object { fun normal(s: String)=CatalogueSearch.normal(s) }
 }
