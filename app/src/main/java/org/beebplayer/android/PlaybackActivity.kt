@@ -85,7 +85,7 @@ class PlaybackActivity : ComponentActivity() {
         val root = object : FrameLayout(this) {
             override fun dispatchKeyEvent(event: KeyEvent): Boolean = if (handlePlaybackKey(event)) true else super.dispatchKeyEvent(event)
         }.apply { setBackgroundColor(Color.BLACK) }
-        view = PlayerView(this).apply { player = this@PlaybackActivity.player; useController = true; controllerShowTimeoutMs = 1500; controllerAutoShow = true; setShowSubtitleButton(true); keepScreenOn = true }
+        view = PlayerView(this).apply { player = this@PlaybackActivity.player; useController = true; controllerShowTimeoutMs = NativePlayerExtras.CONTROLS_TIMEOUT_MS; controllerAutoShow = true; setShowSubtitleButton(true); keepScreenOn = true }
         root.addView(view, FrameLayout.LayoutParams(-1, -1))
         extras = NativePlayerExtras(this, player, view, episode, intent.getStringExtra("title").orEmpty(), ::playNext)
         root.addView(extras, FrameLayout.LayoutParams(-1, -1))
