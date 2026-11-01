@@ -199,7 +199,7 @@ class PlaybackActivity : ComponentActivity() {
     private fun rewind() {
         if (!player.isCurrentMediaItemSeekable) { extras.show(); return }
         val previous = player.currentPosition
-        if (store.autoCaptions() && player.currentTracks.groups.any { it.type == C.TRACK_TYPE_TEXT && it.isSupported } && (temporaryUntil >= 0 || !captionsRequested(player.trackSelectionParameters))) {
+        if (store.autoCaptions() && player.currentTracks.groups.any { it.type == C.TRACK_TYPE_TEXT && it.isSupported } && (temporaryUntil >= 0 || !captionsRequested(player.trackSelectionParameters) && !captionsShowing())) {
             if (temporaryUntil < 0) originalTextParameters = player.trackSelectionParameters
             temporaryUntil = maxOf(temporaryUntil, previous)
             settingTemporaryCaptions = true
@@ -214,7 +214,9 @@ class PlaybackActivity : ComponentActivity() {
         (p.overrides.keys.any { it.type == C.TRACK_TYPE_TEXT } || p.ignoredTextSelectionFlags and C.SELECTION_FLAG_FORCED.inv() == 0)
     private fun captionsOnParameters(p: TrackSelectionParameters, language: String) = p.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
         .setIgnoredTextSelectionFlags(0).setPreferredTextLanguage(language).setSelectUndeterminedTextLanguage(true).build()
-    private fun restoreCaptions() { settingTemporaryCaptions = true; originalTextParameters?.let { player.trackSelectionParameters = it }; originalTextParameters = null; temporaryUntil = -1; settingTemporaryCaptions = false; extras.dismissTransientNotice() }
+    private fun captionsShowing() = player.currentTracks.groups.any { it.type == C.TRACK_TYPE_TEXT && it.isSelected }
+    // Never switch subtitles off at the end of a rewind when the viewer's default is subtitles on.
+    private fun restoreCaptions() { settingTemporaryCaptions = true; originalTextParameters?.takeIf { store.subtitles() != "on" }?.let { player.trackSelectionParameters = it }; originalTextParameters = null; temporaryUntil = -1; settingTemporaryCaptions = false; extras.dismissTransientNotice() }
     private fun save() { episode?.let { store.update(it, next, player.currentPosition, player.duration) } }
     override fun onSaveInstanceState(outState: Bundle) { outState.putLong("position", player.currentPosition); super.onSaveInstanceState(outState) }
     override fun onPause() { if (::player.isInitialized) { save(); player.pause() }; super.onPause() }
