@@ -22,8 +22,12 @@ data class Programme(val id: String, val title: String, val subtitle: String = "
             require(j.text("id").matches(Regex("[a-z0-9]{8}"))) { "Invalid episode identifier" }
             val v = PlaybackVersions.available(j).firstOrNull() ?: error("No standard version of this episode is currently available.")
             val sub = j.text("subtitle")
-            return Programme(j.text("id"), j.text("title"), sub, j.fields("synopses", "large", "medium", "small"), artwork(j.optJSONObject("images"), episode = true), v.text("id"), j.text("tleo_id", j.text("id")), v.optBoolean("uhd"), v.optBoolean("hdr"), v.optJSONObject("duration")?.text("text").orEmpty(), if (j.text("slice_id") != "" && sub.contains(": ")) sub.substringBefore(": ") else "Episodes", j.optInt("parent_position"), j.text("release_date_time"))
+            return Programme(j.text("id"), j.text("title"), sub, j.fields("synopses", "large", "medium", "small"), artwork(j.optJSONObject("images"), episode = true), v.text("id"), j.text("tleo_id", j.text("id")), v.optBoolean("uhd"), v.optBoolean("hdr"), v.optJSONObject("duration")?.text("text").orEmpty(), seriesOf(sub, j.text("slice_id") != ""), j.optInt("parent_position"), j.text("release_date_time"))
         }
+        // BBC tags most series with a slice; some companion shows (such as The Celebrity Traitors: Uncloaked) only name the series in the subtitle.
+        private val seriesPrefix = Regex("^([^:]*\\b(?:Series|Season)\\s+\\d+): ", RegexOption.IGNORE_CASE)
+        internal fun seriesOf(subtitle: String, sliced: Boolean) =
+            if (sliced && subtitle.contains(": ")) subtitle.substringBefore(": ") else seriesPrefix.find(subtitle)?.groupValues?.get(1) ?: "Episodes"
         fun show(j: JSONObject) = Programme(j.text("id"), j.text("title"), summary = j.optJSONObject("synopses")?.text("medium").orEmpty(), image = artwork(j.optJSONObject("images")), uhd = j.list("initial_children").any { it.list("versions").any { v -> v.optBoolean("uhd") } })
     }
 }

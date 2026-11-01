@@ -15,6 +15,15 @@ class ParsingTest {
         assertFalse(Programme.episode(first).hdr)
         assertEquals(Programme.episode(first), Programme.restore(Programme.episode(first).json()))
     }
+    @Test fun seriesComesFromSubtitleWhenBbcOmitsTheSlice() {
+        assertEquals("Series 2", Programme.seriesOf("Series 2: Episode 9", sliced = false))
+        assertEquals("Traitors Series 3", Programme.seriesOf("Traitors Series 3: Episode 1", sliced = true))
+        assertEquals("Episodes", Programme.seriesOf("Traitor or Faithful? Claudia Decides", sliced = false))
+        assertEquals("Episodes", Programme.seriesOf("Inside the castle: part 1", sliced = false))
+        val mixed = listOf("Series 2: Episode 1" to 1, "Series 1: Episode 1" to 1, "Series 2: Episode 2" to 2, "Series 1: Episode 2" to 2)
+            .mapIndexed { i, (sub, pos) -> Programme("m000000$i", "Show", sub, series = Programme.seriesOf(sub, sliced = false), position = pos) }
+        assertEquals(listOf("Series 1: Episode 1", "Series 1: Episode 2", "Series 2: Episode 1", "Series 2: Episode 2"), Parsing.ordered(mixed).map { it.subtitle })
+    }
     @Test fun bannerAvoidsLogosAndHandlesQuotedBraces() {
         val episode = JSONObject("""{"id":"m0000001","tleo":{"id":"m0000011"},"title":{"default":"Example } title"},"synopsis":{"small":"A \\\"quoted\\\" story"},"image":{"promotional":"https://example.org/{recipe}/plain.jpg","promotionalWithLogo":"https://example.org/logo.jpg"}}""")
         val state = JSONObject().put("bundles", JSONArray().put(JSONObject().put("id", "editorial").put("title", JSONObject().put("default", "New")).put("entities", JSONArray().put(JSONObject().put("episode", episode)))))
