@@ -98,9 +98,11 @@ class BbcApi(private val context: Context) {
     private fun hd(version: String, live: Boolean = false): Stream {
         var last: Exception? = null
         var fallback: Variant? = null
+        var outsideUk = false
         for (api in listOf(6, 5)) for (set in listOf("iptv-all", "pc")) {
             try {
                 val xml = listing(version, set, api)
+                if (xml.contains("id=\"geolocation\"")) { outsideUk = true; continue }
                 val masters = selector(xml, "video")
                 for (master in masters) {
                     try {
@@ -125,6 +127,7 @@ class BbcApi(private val context: Context) {
             } catch (e: Exception) { last = e }
         }
         fallback?.let { return Stream(it.url, version) }
+        if (outsideUk) error("BBC only streams to UK connections, and this connection isn't one right now. Check the VPN and try again.")
         error(last?.message ?: "No compatible BBC stream returned")
     }
     private fun uhd(p: Programme, client: OkHttpClient = vault.selectorClient()): Stream {
