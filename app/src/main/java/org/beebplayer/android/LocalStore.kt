@@ -30,4 +30,7 @@ class LocalStore(context: Context) {
     fun remove(showId: String) { prefs.edit().putString("history", JSONArray(history().filterNot { it.episode.showId == showId }.map { it.json() }).toString()).apply() }
     fun autoCaptions() = prefs.getBoolean("captionsOnRewind", true)
     fun autoCaptions(value: Boolean) { prefs.edit().putBoolean("captionsOnRewind", value).apply() }
+    /** Subtitles at the start of every programme: "system" follows Android's caption setting, "on"/"off" is the viewer's last CC choice. */
+    fun subtitles() = prefs.getString("subtitles", "system") ?: "system"
+    fun subtitles(value: String) { prefs.edit().putString("subtitles", value).apply() }
 }

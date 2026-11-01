@@ -576,6 +576,11 @@ class MainActivity : ComponentActivity() {
             }, { Toast.makeText(this, "The launcher could not accept the live-channel row.", Toast.LENGTH_LONG).show() }) } }
         })
         content.addView(label("Subtitles", 22f))
+        fun subtitlesLabel() = "Subtitles at start: " + when (store.subtitles()) { "on" -> "Always on"; "off" -> "Always off"; else -> "Follow Android caption setting" }
+        content.addView(discoveryText(subtitlesLabel()) {
+            store.subtitles(when (store.subtitles()) { "system" -> "on"; "on" -> "off"; else -> "system" })
+            (content.findFocus() as? TextView)?.text = subtitlesLabel()
+        })
         content.addView(discoveryText("Captions on 10-second rewind: ${if (store.autoCaptions()) "On" else "Off"}") {
             store.autoCaptions(!store.autoCaptions())
             (content.findFocus() as? TextView)?.text="Captions on 10-second rewind: ${if(store.autoCaptions()) "On" else "Off"}"

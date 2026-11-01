@@ -50,6 +50,8 @@ class PlaybackActivity : ComponentActivity() {
     private var temporaryUntil = -1L
     private var originalTextParameters: androidx.media3.common.TrackSelectionParameters? = null
     private var settingTemporaryCaptions = false
+    private var applyingDefaultCaptions = false
+    private var captionsWereOn: Boolean? = null
     private lateinit var captionManager: android.view.accessibility.CaptioningManager
     private val captionListener = object : android.view.accessibility.CaptioningManager.CaptioningChangeListener() {
         override fun onUserStyleChanged(userStyle: android.view.accessibility.CaptioningManager.CaptionStyle) = applyCaptionAppearance()
@@ -113,6 +115,10 @@ class PlaybackActivity : ComponentActivity() {
             override fun onCues(cueGroup: androidx.media3.common.text.CueGroup) { if (cueGroup.cues.isNotEmpty()) captionSamples++; diagnostic("captions") }
             override fun onTrackSelectionParametersChanged(parameters: TrackSelectionParameters) {
                 if (!settingTemporaryCaptions && temporaryUntil >= 0) { originalTextParameters = null; temporaryUntil = -1 }
+                // Remember the viewer's own CC choice as the default for every programme.
+                val on = captionsRequested(parameters)
+                if (!settingTemporaryCaptions && !applyingDefaultCaptions && captionsWereOn != null && on != captionsWereOn) store.subtitles(if (on) "on" else "off")
+                if (!settingTemporaryCaptions) captionsWereOn = on
             }
             override fun onPlayerError(error: PlaybackException) {
                 playerFailure = error.errorCodeName
@@ -163,8 +169,12 @@ class PlaybackActivity : ComponentActivity() {
         player.prepare(); player.playWhenReady = true
         val manager = getSystemService(CAPTIONING_SERVICE) as android.view.accessibility.CaptioningManager
         applyCaptionAppearance()
-        if (manager.isEnabled) player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().setPreferredTextLanguage(manager.locale?.language ?: "en").setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false).build()
-        else player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build()
+        val captionsOn = when (store.subtitles()) { "on" -> true; "off" -> false; else -> manager.isEnabled }
+        applyingDefaultCaptions = true
+        player.trackSelectionParameters = if (captionsOn) captionsOnParameters(player.trackSelectionParameters, manager.locale?.language ?: "en")
+            else player.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build()
+        applyingDefaultCaptions = false
+        captionsWereOn = captionsOn
         extras.play.requestFocus(); extras.show()
     }
     private fun applyCaptionAppearance() {
@@ -189,16 +199,21 @@ class PlaybackActivity : ComponentActivity() {
     private fun rewind() {
         if (!player.isCurrentMediaItemSeekable) { extras.show(); return }
         val previous = player.currentPosition
-        if (store.autoCaptions() && player.currentTracks.groups.any { it.type == C.TRACK_TYPE_TEXT && it.isSupported } && (temporaryUntil >= 0 || player.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT))) {
+        if (store.autoCaptions() && player.currentTracks.groups.any { it.type == C.TRACK_TYPE_TEXT && it.isSupported } && (temporaryUntil >= 0 || !captionsRequested(player.trackSelectionParameters))) {
             if (temporaryUntil < 0) originalTextParameters = player.trackSelectionParameters
             temporaryUntil = maxOf(temporaryUntil, previous)
             settingTemporaryCaptions = true
-            player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false).setPreferredTextLanguage("en").setSelectUndeterminedTextLanguage(true).build()
+            player.trackSelectionParameters = captionsOnParameters(player.trackSelectionParameters, "en")
             settingTemporaryCaptions = false
         }
         if (player.isCurrentMediaItemSeekable) player.seekTo(maxOf(0, previous - 10_000))
         extras.show(); if (temporaryUntil >= 0) extras.replayNotice()
     }
+    /** Subtitles are on unless Beeb disabled them or Media3's CC menu chose "Off" (which ignores ordinary subtitle tracks). */
+    private fun captionsRequested(p: TrackSelectionParameters) = !p.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT) &&
+        (p.overrides.keys.any { it.type == C.TRACK_TYPE_TEXT } || p.ignoredTextSelectionFlags and C.SELECTION_FLAG_FORCED.inv() == 0)
+    private fun captionsOnParameters(p: TrackSelectionParameters, language: String) = p.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+        .setIgnoredTextSelectionFlags(0).setPreferredTextLanguage(language).setSelectUndeterminedTextLanguage(true).build()
     private fun restoreCaptions() { settingTemporaryCaptions = true; originalTextParameters?.let { player.trackSelectionParameters = it }; originalTextParameters = null; temporaryUntil = -1; settingTemporaryCaptions = false; extras.dismissTransientNotice() }
     private fun save() { episode?.let { store.update(it, next, player.currentPosition, player.duration) } }
     override fun onSaveInstanceState(outState: Bundle) { outState.putLong("position", player.currentPosition); super.onSaveInstanceState(outState) }
