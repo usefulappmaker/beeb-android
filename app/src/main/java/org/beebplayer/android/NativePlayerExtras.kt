@@ -28,6 +28,8 @@ class NativePlayerExtras(context: Context, private val player: ExoPlayer, privat
     private var activeSkip: Skip? = null
     private var nextEpisode: Programme? = null
     private var firstFrame = false
+    // The control the viewer last moved to, so focus returns there when the controls reappear.
+    private var lastControl: View? = null
     val quality = button("", "Received stream quality") { qualityDialog() }
     val skip = button("Skip intro", "Skip intro") { activeSkip?.let { player.seekTo(it.endMs); show() } }
     private val nextButton = button("Play next", "Play next episode") { nextAction() }
@@ -55,11 +57,18 @@ class NativePlayerExtras(context: Context, private val player: ExoPlayer, privat
             metadata.visibility = visibility; quality.visibility = if (quality.text.isNotEmpty()) visibility else GONE
             playerView.subtitleView?.setBottomPaddingFraction(if (visibility == VISIBLE) .22f else .08f)
         })
+        playerView.viewTreeObserver.addOnGlobalFocusChangeListener { _, now -> if (now != null && now !== playerView && isInside(now, playerView)) lastControl = now }
+        listOf(metadata, quality, skip, nextButton).forEach(::highlightFocus)
+        playerView.findViewById<View>(androidx.media3.ui.R.id.exo_controller)?.let(::highlightControls)
         update()
     }
-    fun show(focus: Boolean = true) { playerView.showController(); if (focus && !play.hasFocus() && !metadata.hasFocus() && !quality.hasFocus() && !skip.hasFocus() && !nextButton.hasFocus()) play.requestFocus() }
+    fun show(focus: Boolean = true) {
+        playerView.showController()
+        if (!focus || play.hasFocus() || metadata.hasFocus() || quality.hasFocus() || skip.hasFocus() || nextButton.hasFocus()) return
+        if (lastControl?.takeIf { it.isShown }?.requestFocus() != true) play.requestFocus()
+    }
     fun hide() = playerView.hideController()
-    fun scheduleHide() { if (player.isPlaying && dialog == null) playerView.controllerShowTimeoutMs = 1500 }
+    fun scheduleHide() { if (player.isPlaying && dialog == null) playerView.controllerShowTimeoutMs = CONTROLS_TIMEOUT_MS }
     fun ready() { if (!firstFrame) { firstFrame = true; show() } }
     fun update(marker: Skip? = activeSkip, upcoming: Programme? = nextEpisode) {
         activeSkip = marker; nextEpisode = upcoming
@@ -74,7 +83,7 @@ class NativePlayerExtras(context: Context, private val player: ExoPlayer, privat
     }
     fun replayNotice() { Toast.makeText(context, "Rewound 10 seconds · captions temporarily on", Toast.LENGTH_SHORT).show() }
     fun dismissTransientNotice() = Unit
-    private fun present(d: Dialog) { dialog?.dismiss(); dialog = d; playerView.controllerShowTimeoutMs = 0; show(false); d.setOnDismissListener { dialog = null; playerView.controllerShowTimeoutMs = 1500; show() }; d.show() }
+    private fun present(d: Dialog) { dialog?.dismiss(); dialog = d; playerView.controllerShowTimeoutMs = 0; show(false); d.setOnDismissListener { dialog = null; playerView.controllerShowTimeoutMs = CONTROLS_TIMEOUT_MS; show() }; d.show() }
     private fun detailsDialog() {
         val info = listOfNotNull(episode?.subtitle?.takeIf { it.isNotBlank() }, episode?.duration?.takeIf { it.isNotBlank() }?.let { "Length: $it" }, broadcastDate(episode?.date.orEmpty()).takeIf { it.isNotBlank() }?.let { "Broadcast: $it" }, episode?.summary?.takeIf { it.isNotBlank() }).joinToString("\n\n")
         present(AlertDialog.Builder(context).setTitle(episode?.title ?: "Programme details").setMessage(info.ifBlank { "Programme information is unavailable." }).setPositiveButton("Close", null).create())
@@ -88,8 +97,16 @@ class NativePlayerExtras(context: Context, private val player: ExoPlayer, privat
     internal fun debugDismissDialog() { check(BuildConfig.DEBUG); dialog?.dismiss() }
     fun dispose() { dialog?.setOnDismissListener(null); dialog?.dismiss(); dialog = null }
     private fun dp(n: Int) = (n * resources.displayMetrics.density).toInt()
+    private fun isInside(view: View, parent: View): Boolean { var v: View? = view; while (v != null) { if (v === parent) return true; v = v.parent as? View }; return false }
+    private fun highlightControls(view: View) { if (view is android.view.ViewGroup) (0 until view.childCount).forEach { highlightControls(view.getChildAt(it)) } else if (view.isFocusable) highlightFocus(view) }
+    /** A soft white halo on the focused control: clearer than Media3's default from the sofa, without drawing attention away from the video. */
+    private fun highlightFocus(view: View) {
+        val ring = GradientDrawable().apply { cornerRadius = dp(48).toFloat(); setColor(0x26FFFFFF); setStroke(dp(2), 0x99FFFFFF.toInt()) }
+        view.foreground = android.graphics.drawable.StateListDrawable().apply { addState(intArrayOf(android.R.attr.state_focused), ring) }
+    }
     private fun label(value: String, size: Float) = TextView(context).apply { text = value; textSize = size; setTextColor(Color.WHITE); setPadding(0, dp(2), 0, dp(2)) }
     private fun button(title: String, description: String, action: () -> Unit) = Button(context).apply { text = title; textSize = 14f; isAllCaps = false; contentDescription = description; setOnClickListener { action() } }
+    companion object { const val CONTROLS_TIMEOUT_MS = 5000 }
     private fun broadcastDate(raw: String): String {
         if (raw.isBlank()) return ""
         val date = runCatching { Instant.parse(raw).atZone(java.time.ZoneId.systemDefault()).toLocalDate() }.getOrElse { runCatching { LocalDate.parse(raw.take(10)) }.getOrNull() } ?: return raw
