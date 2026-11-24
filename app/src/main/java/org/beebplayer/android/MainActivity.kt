@@ -45,6 +45,34 @@ class MainActivity : ComponentActivity() {
     private var searchRevision = 0
     private var refreshingCatalogue = false
     private val catalogue by lazy { CatalogueIndex(this, api) }
+    private var pendingRestore: ByteArray? = null
+    private val importBackupPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        showBackupProgress("Reading backup…")
+        io.execute {
+            val bytes = runCatching { contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: error("unreadable") }
+            main.post {
+                if (isDestroyed) return@post
+                backupProgress?.dismiss(); backupProgress = null
+                bytes.fold({ data ->
+                    if (data.size > IdentityBackup.MAX_BYTES) { data.fill(0); Toast.makeText(this, "That file is too large to be a Beeb backup", Toast.LENGTH_LONG).show(); return@fold }
+                    pendingRestore = data
+                    passwordPrompt("Restore UHD backup", false) { password ->
+                        val payload = pendingRestore; pendingRestore = null
+                        if (payload == null) { password.fill('\u0000'); return@passwordPrompt }
+                        showBackupProgress("Restoring UHD identity…")
+                        io.execute {
+                            val restored = runCatching { api.vault.importBackup(payload, password) }
+                            password.fill('\u0000'); payload.fill(0)
+                            main.post { if (!isDestroyed) { backupProgress?.dismiss(); backupProgress = null
+                                Toast.makeText(this, if (restored.isSuccess) "UHD identity restored" else (restored.exceptionOrNull()?.message ?: "Unable to restore that backup"), Toast.LENGTH_LONG).show()
+                                if (restored.isSuccess) settings() } }
+                        }
+                    }
+                }, { Toast.makeText(this, "Unable to read the backup file", Toast.LENGTH_LONG).show() })
+            }
+        }
+    }
     private val voiceSearch = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         val query = result.data?.getStringArrayListExtra(android.speech.RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
         if (result.resultCode == RESULT_OK && !query.isNullOrBlank()) { searchQuery = query; search() }
@@ -61,15 +89,23 @@ class MainActivity : ComponentActivity() {
     private val main = Handler(Looper.getMainLooper())
     private var generation = 0
     private var currentTab = "Home"
-    private val backStack = mutableListOf<() -> Unit>()
+    private data class BackEntry(val restore: () -> Unit, val focusId: String?)
+    private val backStack = mutableListOf<BackEntry>()
+    private val cardsById = mutableMapOf<String, View>()
+    private var lastFocusedId: String? = null
+    private var pendingFocusId: String? = null
+    private var focusContent = false
+    private var heroAdvance: (() -> Unit)? = null
+    private var firstCardOfScreen: View? = null
+    private var entryFocusTarget: View? = null
     private val pink = Color.rgb(250, 35, 137)
     private val ink = Color.rgb(16, 16, 22)
     private var homeFeed: Home? = null
     private var featureIndex = 0
     private var banner: View? = null
     private var returnScreen: () -> Unit = { home() }
-    private val rotate = object : Runnable { override fun run() { if (currentTab == "Home" && backStack.isEmpty() && !body.hasFocus()) { featureIndex++; renderHome() }; main.postDelayed(this, 8000) } }
-    private val liveRefresh = object : Runnable { override fun run() { if (currentTab == "Live" && backStack.isEmpty()) live(); main.postDelayed(this, 60_000) } }
+    private val rotate = object : Runnable { override fun run() { if (currentTab == "Home" && backStack.isEmpty() && !body.hasFocus() && episodePanel?.isShowing != true) heroAdvance?.invoke(); main.postDelayed(this, 8000) } }
+    private val liveRefresh = object : Runnable { override fun run() { if (currentTab == "Live" && backStack.isEmpty() && !body.hasFocus() && episodePanel?.isShowing != true) refreshLiveInPlace(); main.postDelayed(this, 60_000) } }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -82,13 +118,13 @@ class MainActivity : ComponentActivity() {
         for (tab in listOf("Home", "Browse", "Search", "Live", "Saved", "Settings")) {
             val item = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
-                isFocusable = true; isFocusableInTouchMode = true; contentDescription = tab
+                isFocusable = true; isFocusableInTouchMode = true; contentDescription = tab; id = View.generateViewId()
                 setPadding(dp(18), dp(4), dp(18), 0)
                 addView(label(tab, 19f).apply { gravity = Gravity.CENTER; setPadding(0, dp(6), 0, dp(8)) }, LinearLayout.LayoutParams(-2, -2))
                 addView(View(this@MainActivity), LinearLayout.LayoutParams(dp(24), dp(3)))
                 setOnFocusChangeListener { _, _ -> updateTabs() }
                 setOnClickListener {
-                    backStack.clear(); currentTab = tab
+                    backStack.clear(); currentTab = tab; focusContent = false; pendingFocusId = null
                     when (tab) { "Home" -> home(); "Browse" -> browse(); "Search" -> search(); "Live" -> live(); "Saved" -> saved(); else -> settings() }
                 }
             }
@@ -100,14 +136,15 @@ class MainActivity : ComponentActivity() {
         val scroll = ScrollView(this).apply { isFillViewport = true; clipToPadding = false }
         body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(10), dp(8), dp(10), dp(30)); clipChildren = false }
         scroll.addView(body); root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(24) }); setContentView(root)
+        focusContent = true
         if (!handleLaunch(intent)) home()
         io.execute { LiveHomeChannels.refreshIfNeeded(this) }
     }
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); setIntent(intent); handleLaunch(intent) }
     private fun handleLaunch(incoming: Intent): Boolean {
-        if (incoming.action == Intent.ACTION_APPLICATION_PREFERENCES) { currentTab = "Settings"; settings(); return true }
+        if (incoming.action == Intent.ACTION_APPLICATION_PREFERENCES) { currentTab = "Settings"; focusContent = true; settings(); return true }
         val channel = LiveHomeChannels.channelId(incoming) ?: return false
-        backStack.clear(); currentTab = "Live"; live()
+        backStack.clear(); currentTab = "Live"; focusContent = true; live()
         if (channel != "all") startActivity(Intent(this, PlaybackActivity::class.java).putExtra("channel", channel).putExtra("title", "BBC Live"))
         return true
     }
@@ -116,13 +153,44 @@ class MainActivity : ComponentActivity() {
             platformBack = android.window.OnBackInvokedCallback { navigateBack() }
             onBackInvokedDispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, platformBack!!)
         }
- main.postDelayed(rotate, 8000); main.postDelayed(liveRefresh, 60_000); if (::store.isInitialized && currentTab == "Home" && backStack.isEmpty() && homeFeed != null) renderHome() }
+ main.postDelayed(rotate, 8000); main.postDelayed(liveRefresh, 60_000); if (::store.isInitialized && currentTab == "Home" && backStack.isEmpty() && homeFeed != null) { pendingFocusId = lastFocusedId; focusContent = true; renderHome() } }
     override fun onPause() {
         if (android.os.Build.VERSION.SDK_INT >= 33) platformBack?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
         platformBack = null
         main.removeCallbacks(rotate); main.removeCallbacks(liveRefresh); super.onPause() }
     override fun onDestroy() { directSetup?.cancel(); setupProgress?.dismiss(); episodePanel?.dismiss(); backupProgress?.dismiss(); generation++; searchRevision++; searchTask?.cancel(true); searchWorker.shutdownNow(); main.removeCallbacksAndMessages(null); io.shutdownNow(); super.onDestroy() }
-    private fun navigateBack() { if (episodePanel?.isShowing == true) episodePanel?.dismiss() else if (backStack.isNotEmpty()) backStack.removeAt(backStack.lastIndex).invoke() else if (currentTab != "Home") { currentTab = "Home"; home() } else finish() }
+    private fun navigateBack() {
+        if (episodePanel?.isShowing == true) { episodePanel?.dismiss(); return }
+        if (backStack.isNotEmpty()) {
+            val entry = backStack.removeAt(backStack.lastIndex)
+            pendingFocusId = entry.focusId; focusContent = true; entry.restore(); return
+        }
+        if (currentTab != "Home") { currentTab = "Home"; focusContent = true; home() } else finish()
+    }
+    /** Move focus onto the page: the card the viewer came from, else the first interactive item. */
+    private fun applyEntryFocus() {
+        if (!focusContent) return
+        focusContent = false
+        val wanted = pendingFocusId ?: lastFocusedId
+        pendingFocusId = null
+        main.post {
+            val target = wanted?.let { cardsById[it] }?.takeIf { it.isFocusable }
+                ?: entryFocusTarget?.takeIf { it.isFocusable && it.isAttachedToWindow }
+                ?: firstCardOfScreen?.takeIf { it.isAttachedToWindow }
+                ?: firstFocusable(content)
+            target?.requestFocus()
+        }
+    }
+    private fun firstFocusable(group: ViewGroup): View? {
+        for (i in 0 until group.childCount) {
+            val child = group.getChildAt(i)
+            if (child.visibility != View.VISIBLE) continue
+            if (child.isFocusable) return child
+            if (child is ViewGroup) firstFocusable(child)?.let { return it }
+        }
+        return null
+    }
+    private fun refreshLiveInPlace() { pendingFocusId = lastFocusedId; focusContent = true; live() }
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
     private fun label(text: String, size: Float = 22f, muted: Boolean = false) = TextView(this).apply { this.text = text; textSize = size; setTextColor(if (muted) 0xFFB6B2C0.toInt() else Color.WHITE); setPadding(0, dp(6), 0, dp(8)) }
     private fun border(focused: Boolean) = GradientDrawable().apply { setColor(if (focused) 0xFF382039.toInt() else 0xFF1C1B24.toInt()); cornerRadius = dp(10).toFloat(); setStroke(dp(if (focused) 3 else 1), if (focused) pink else 0xFF47434E.toInt()) }
@@ -144,7 +212,7 @@ class MainActivity : ComponentActivity() {
         }
     }
     private fun reset(title: String): Int {
-        generation++; searchRevision++; searchTask?.cancel(true); searchInput = null; searchUpdate?.let(main::removeCallbacks); body.removeAllViews(); banner = null
+        generation++; searchRevision++; searchTask?.cancel(true); searchInput = null; searchUpdate?.let(main::removeCallbacks); body.removeAllViews(); banner = null; cardsById.clear(); heroAdvance = null; firstCardOfScreen = null; entryFocusTarget = null
         updateTabs()
         pageHeader = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(0, 0, 0, dp(8)) }
         if (title != "Home") {
@@ -156,12 +224,13 @@ class MainActivity : ComponentActivity() {
     }
     private fun <T> load(title: String, task: () -> T, done: (T) -> Unit) {
         val id = reset(title); val spinner = label("Loading…", 18f, true); content.addView(spinner)
-        io.execute { val result = runCatching(task); main.post { if (generation == id && !isDestroyed) { content.removeView(spinner); result.fold(done) { error -> content.addView(label(error.message ?: "Unable to load", 19f, true)); content.addView(button("Retry") { load(title, task, done) }) } } } }
+        io.execute { val result = runCatching(task); main.post { if (generation == id && !isDestroyed) { content.removeView(spinner); result.fold({ done(it); applyEntryFocus() }) { error -> content.addView(label(error.message ?: "Unable to load", 19f, true)); val retry = button("Retry") { load(title, task, done) }; content.addView(retry); main.post { retry.requestFocus() } } } } }
     }
     private fun image(url: String, height: Int) = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP; setBackgroundColor(0xFF24212A.toInt()); layoutParams = LinearLayout.LayoutParams(-1, dp(height)); contentDescription = null; if (url.isNotEmpty()) Images.load(api, url, this) }
     private fun card(p: Programme, action: () -> Unit): View = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL; setPadding(dp(4), dp(4), dp(4), dp(4))
         isFocusable = true; isFocusableInTouchMode = true; contentDescription = p.title + " " + p.subtitle
+        tag = p.id; cardsById[p.id] = this; if (firstCardOfScreen == null) firstCardOfScreen = this
         val art = image(p.image, 140).apply {
             background = GradientDrawable().apply { setColor(0xFF24212A.toInt()); cornerRadius = dp(8).toFloat() }
             clipToOutline = true
@@ -169,8 +238,8 @@ class MainActivity : ComponentActivity() {
         addView(art)
         val caption = label(p.subtitle.ifEmpty { p.title }, 17f).apply { maxLines = 2; minLines = 2; setPadding(dp(2), dp(10), dp(2), 0) }
         addView(caption)
-        if (p.uhd) addView(label(if (p.hdr) "4K HDR" else "4K", 12f, true))
         setOnFocusChangeListener { _, on ->
+            if (on) lastFocusedId = p.id
             art.foreground = if (on) GradientDrawable().apply { setColor(Color.TRANSPARENT); cornerRadius = dp(8).toFloat(); setStroke(dp(3), Color.WHITE) } else null
             caption.setTextColor(if (on) Color.WHITE else 0xFFCDCCD4.toInt())
             animate().scaleX(if (on) 1.025f else 1f).scaleY(if (on) 1.025f else 1f).setDuration(120).start()
@@ -184,14 +253,16 @@ class MainActivity : ComponentActivity() {
         programmes.forEach { p -> line.addView(card(p) { onSelect(p) }, LinearLayout.LayoutParams(dp(250), -2).apply { marginEnd = dp(16) }) }
         content.addView(HorizontalScrollView(this).apply { clipToPadding = false; addView(line) })
     }
-    private fun grid(items: List<Programme>, onSelect: (Programme) -> Unit) {
+    private fun grid(items: List<Programme>, onSelect: (Programme) -> Unit): List<View> {
         val available = resources.displayMetrics.widthPixels / resources.displayMetrics.density - 116
         val columns = maxOf(2, (available / 265).toInt())
+        val cards = mutableListOf<View>()
         items.chunked(columns).forEach { group ->
             val line = LinearLayout(this)
-            group.forEach { p -> line.addView(card(p) { onSelect(p) }, LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dp(4), dp(4), dp(10), dp(12)) }) }
+            group.forEach { p -> val item = card(p) { onSelect(p) }; cards += item; line.addView(item, LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dp(4), dp(4), dp(10), dp(12)) }) }
             repeat(columns - group.size) { line.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f)) }; content.addView(line)
         }
+        return cards
     }
     private fun home() { returnScreen = { home() }; if (homeFeed != null) renderHome() else load("Home", { api.home() }) { homeFeed = it; renderHome() } }
     private fun renderHome() {
@@ -229,7 +300,7 @@ class MainActivity : ComponentActivity() {
                 } else false
             }
             panel.setOnClickListener { openShow(feed.features[Math.floorMod(featureIndex, feed.features.size)].show) }
-            updateFeature(); content.addView(panel); banner = panel
+            updateFeature(); content.addView(panel); banner = panel; entryFocusTarget = panel; heroAdvance = { featureIndex++; updateFeature() }
         }
         val history = store.history()
         if (history.isNotEmpty()) {
@@ -240,13 +311,13 @@ class MainActivity : ComponentActivity() {
                 val view = card(target.copy(subtitle = (if (record.completed) "Up next · " else "Resume · ") + target.subtitle)) {
                     if (record.completed && record.next == null) openShow(Programme(record.episode.showId, record.episode.title)) else episode(target, record.next)
                 }
-                view.setOnLongClickListener { AlertDialog.Builder(this).setMessage("Remove ${record.episode.title} from Continue Watching?").setPositiveButton("Remove") { _, _ -> store.remove(record.episode.showId); renderHome() }.setNegativeButton("Cancel", null).show(); true }
+                view.setOnLongClickListener { AlertDialog.Builder(this).setMessage("Remove ${record.episode.title} from Continue Watching?").setPositiveButton("Remove") { _, _ -> store.remove(record.episode.showId); pendingFocusId = null; focusContent = true; renderHome() }.setNegativeButton("Cancel", null).show(); true }
                 line.addView(view, LinearLayout.LayoutParams(dp(250), -2).apply { marginEnd = dp(16) })
             }
             content.addView(HorizontalScrollView(this).apply { addView(line) })
         }
         feed.rows.take(8).forEach { (title, shows) -> row(title, shows, ::openShow) }
-        content.addView(button("Refresh Home") { homeFeed = null; home() })
+        content.addView(button("Refresh Home") { homeFeed = null; focusContent = true; pendingFocusId = null; home() }); applyEntryFocus()
     }
     private fun discoveryText(text: String, action: () -> Unit) = TextView(this).apply {
         this.text=text; textSize=19f; gravity=Gravity.CENTER_VERTICAL
@@ -262,7 +333,7 @@ class MainActivity : ComponentActivity() {
     private fun browse() {
         returnScreen = { browse() }; reset("Browse")
         content.addView(label("Discover",22f))
-        content.addView(discoveryText("4K UHD   ›") { uhdCatalogue() },LinearLayout.LayoutParams(-1,dp(58)))
+        content.addView(discoveryText("4K UHD   ›") { focusContent = true; pendingFocusId = null; uhdCatalogue() },LinearLayout.LayoutParams(-1,dp(58)))
         content.addView(label("Categories",22f))
         val categoriesHost=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL }
         content.addView(categoriesHost)
@@ -278,9 +349,11 @@ class MainActivity : ComponentActivity() {
                 row.addView(discoveryText(title) { page(key,true,1) },LinearLayout.LayoutParams(0,dp(54),1f).apply { marginEnd=dp(14) })
             }; repeat(3-group.size) { row.addView(View(this),LinearLayout.LayoutParams(0,1,1f)) }; categoriesHost.addView(row) }
         },{ categoriesHost.addView(label("Categories unavailable. A–Z and 4K UHD are still available.",16f,true)) }) } }
+        applyEntryFocus()
     }
     private fun uhdCatalogue() {
-        if(backStack.isEmpty()) backStack.add { browse() }
+        if(backStack.isEmpty()) backStack.add(BackEntry({ browse() }, lastFocusedId))
+        focusContent = true; pendingFocusId = null
         returnScreen={ uhdCatalogue() }; reset("4K UHD")
         val items=catalogue.allUhd()
         content.addView(label("${items.size} programmes",16f,true))
@@ -288,20 +361,21 @@ class MainActivity : ComponentActivity() {
         lateinit var more: TextView
         fun append() {
             if(::content.isInitialized) content.removeView(more)
-            val next=items.drop(shown).take(30); shown+=next.size; grid(next,::openShow)
+            val next=items.drop(shown).take(30); shown+=next.size; val added=grid(next,::openShow)
             more.text="Show more programmes  ›"; if(shown<items.size) content.addView(more)
+            if(shown>next.size) main.post { added.firstOrNull()?.requestFocus() }
         }
         more=discoveryText("Show more programmes  ›") { append() }; append()
         val status=label("",15f,true);content.addView(status)
         content.addView(discoveryText("Refresh catalogue") { refreshCatalogue(status,true) { if(currentTab=="Browse") uhdCatalogue() } })
-        refreshCatalogue(status,false) { if(currentTab=="Browse") uhdCatalogue() }
+        refreshCatalogue(status,false) { if(currentTab=="Browse") uhdCatalogue() }; applyEntryFocus()
     }
     private fun refreshCatalogue(status: TextView, force: Boolean, done: () -> Unit) {
         if(refreshingCatalogue || !force && !catalogue.needsRefresh()) return
         refreshingCatalogue=true;status.text="Updating programme catalogue…"
         io.execute { val result=runCatching { catalogue.refresh() }; main.post {
             refreshingCatalogue=false
-            if(!isDestroyed && status.isAttachedToWindow) result.fold({ status.text="Catalogue updated";done() },{ status.text="Using the saved catalogue. Refresh is unavailable right now." })
+            if(!isDestroyed && status.isAttachedToWindow) result.fold({ status.text="Catalogue updated"; if(force) done() },{ status.text="Using the saved catalogue. Refresh is unavailable right now." })
         } }
     }
     private fun search() {
@@ -347,8 +421,9 @@ class MainActivity : ComponentActivity() {
                     fun append() {
                         results.removeView(more); val next=matches.drop(shown).take(if(shown==0)9 else 30);shown+=next.size
                         val previous=content;content=results
-                        try { grid(next,::openShow) } finally { content=previous }
+                        val added=try { grid(next,::openShow) } finally { content=previous }
                         if(shown<matches.size)results.addView(more)
+                        if(shown>next.size) main.post { added.firstOrNull()?.requestFocus() }
                     }
                     more=discoveryText("More results  ›") { append() };append()
                     if(moveFocus) (0 until results.childCount).map {results.getChildAt(it)}.filterIsInstance<LinearLayout>().firstOrNull()?.getChildAt(0)?.requestFocus()
@@ -367,10 +442,11 @@ class MainActivity : ComponentActivity() {
             } else false
         }
         content.addView(discoveryText("Refresh catalogue") { refreshCatalogue(status,true) { render() } })
-        render();refreshCatalogue(status,false) { render() }
+        render();refreshCatalogue(status,false) { render() }; applyEntryFocus()
     }
     private fun page(key: String, category: Boolean, number: Int) {
-        if (backStack.isEmpty()) backStack.add { browse() }
+        if (backStack.isEmpty()) backStack.add(BackEntry({ browse() }, lastFocusedId))
+        focusContent = true; pendingFocusId = null
         returnScreen = { page(key, category, number) }
         load(key.replaceFirstChar(Char::uppercase), { api.page(key, category, number) }) { result ->
             val bar = LinearLayout(this); if (number > 1) bar.addView(button("‹ Previous") { page(key, category, number - 1) }); bar.addView(label("  Page $number / ${result.totalPages}  ", 18f)); if (number < result.totalPages) bar.addView(button("Next ›") { page(key, category, number + 1) }); content.addView(bar)
@@ -379,7 +455,8 @@ class MainActivity : ComponentActivity() {
     }
     private fun openShow(show: Programme) {
         val previousScreen = returnScreen
-        backStack.add(previousScreen)
+        backStack.add(BackEntry(previousScreen, lastFocusedId))
+        focusContent = true; pendingFocusId = null
         load(show.title, { api.episodes(show) }) { episodes ->
             io.execute { runCatching { catalogue.discover(show,episodes) } }
             content.addView(label(show.summary, 19f, true))
@@ -399,43 +476,58 @@ class MainActivity : ComponentActivity() {
                 update()
                 setOnClickListener { store.toggle(show); update(); announceForAccessibility(if (store.isSaved(show)) "Programme saved" else "Programme removed from Saved") }
             }
+            bookmark.id = View.generateViewId()
+            bookmark.nextFocusUpId = tabViews[currentTab]?.id ?: View.NO_ID
             pageHeader.addView(bookmark, LinearLayout.LayoutParams(dp(48), dp(48)))
             if (episodes.isEmpty()) content.addView(label("No episodes available.", 20f))
             val episodeHost = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-            val groups = episodes.groupBy { it.series }
-            fun showSeries(items: List<Programme>, page: Int = 1) {
+            val groups = SeriesCatalog.groups(episodes)
+            fun showSeries(items: List<Programme>, page: Int = 1, focusFirst: Boolean = false) {
                 episodeHost.removeAllViews()
                 val previous = content; content = episodeHost
-                if (items.size > 30) { val bar = LinearLayout(this); if (page > 1) bar.addView(button("‹ Previous episodes") { showSeries(items, page - 1) }); if (page * 30 < items.size) bar.addView(button("More episodes ›") { showSeries(items, page + 1) }); content.addView(bar) }
-                grid(items.drop((page - 1) * 30).take(30)) { p ->
-                    val index = episodes.indexOfFirst { it.id == p.id }; val candidate = episodes.getOrNull(index + 1)
-                    val next = candidate?.takeIf { p.position > 0 && it.position > 0 || p.date.isNotEmpty() && it.date.isNotEmpty() }
+                if (items.size > 30) { val bar = LinearLayout(this); if (page > 1) bar.addView(button("‹ Previous episodes") { showSeries(items, page - 1, true) }); if (page * 30 < items.size) bar.addView(button("More episodes ›") { showSeries(items, page + 1, true) }); content.addView(bar) }
+                val cards = grid(items.drop((page - 1) * 30).take(30)) { p ->
+                    val next = items.getOrNull(items.indexOfFirst { it.id == p.id } + 1)
+                        ?.takeIf { p.position > 0 && it.position > 0 || p.date.isNotEmpty() && it.date.isNotEmpty() }
                     episode(p, next)
-                }; content = previous
+                }
+                content = previous
+                // Switching page removes the button that held focus; focus the new page's first
+                // episode instead of letting the D-pad fall back to the navigation bar.
+                if (focusFirst) main.post { cards.firstOrNull()?.takeIf { it.isAttachedToWindow }?.requestFocus() }
             }
             if (groups.size > 1) {
-                val line = LinearLayout(this).apply { setPadding(0, dp(8), 0, dp(12)) }
-                var selected = groups.keys.first()
+                var selected = groups.first().label
+                val tabs = mutableListOf<TextView>()
                 fun updateSeries() {
-                    for (i in 0 until line.childCount) (line.getChildAt(i) as TextView).apply {
-                        val active = tag == selected
-                        setTextColor(if (active) ink else if (hasFocus()) Color.WHITE else 0xFFB6B2C0.toInt())
-                        background = GradientDrawable().apply { cornerRadius = dp(24).toFloat(); setColor(if (active) Color.WHITE else if (hasFocus()) 0xFF393640.toInt() else Color.TRANSPARENT) }
+                    tabs.forEach { tab ->
+                        val active = tab.tag == selected
+                        tab.setTextColor(if (active) ink else if (tab.hasFocus()) Color.WHITE else 0xFFB6B2C0.toInt())
+                        tab.background = GradientDrawable().apply { cornerRadius = dp(24).toFloat(); setColor(if (active) Color.WHITE else if (tab.hasFocus()) 0xFF393640.toInt() else Color.TRANSPARENT) }
                     }
                 }
-                groups.forEach { (title, items) ->
-                    val tab = TextView(this).apply {
-                        tag = title; text = if (title == "Episodes") "Specials" else title; textSize = 17f; gravity = Gravity.CENTER; isFocusable = true
-                        setPadding(dp(22), dp(10), dp(22), dp(10))
-                        setOnFocusChangeListener { _, _ -> updateSeries() }
-                        setOnClickListener { selected = title; updateSeries(); showSeries(items) }
-                    }
+                fun tabFor(group: SeriesCatalog.Group) = TextView(this).apply {
+                    tag = group.label; text = if (group.label == SeriesCatalog.EPISODES) "Specials" else group.label; textSize = 17f; gravity = Gravity.CENTER; isFocusable = true
+                    setPadding(dp(22), dp(10), dp(22), dp(10))
+                    setOnFocusChangeListener { _, _ -> updateSeries() }
+                    setOnClickListener { selected = group.label; updateSeries(); showSeries(group.episodes) }
+                }
+                // One line, in order, scrolled horizontally: D-pad Left/Right strolls through the
+                // runs and the scroll view keeps the focused tab in view.
+                val line = LinearLayout(this).apply { setPadding(0, dp(8), 0, dp(12)) }
+                groups.forEach { group ->
+                    val tab = tabFor(group); tabs += tab
                     line.addView(tab, LinearLayout.LayoutParams(-2, dp(44)).apply { marginEnd = dp(10) })
                 }
+                content.addView(HorizontalScrollView(this).apply {
+                    isFocusable = false
+                    isHorizontalScrollBarEnabled = false
+                    clipToPadding = false
+                    addView(line)
+                })
                 updateSeries()
-                content.addView(HorizontalScrollView(this).apply { addView(line) })
             }
-            content.addView(episodeHost); groups.values.firstOrNull()?.let { showSeries(it) }
+            content.addView(episodeHost); groups.firstOrNull()?.let { showSeries(it.episodes, focusFirst = true) }
         }
     }
     private fun episode(p: Programme, next: Programme?) {
@@ -453,7 +545,7 @@ class MainActivity : ComponentActivity() {
         header.addView(label(p.title, 14f, true).apply { setTextColor(pink); letterSpacing = .08f; maxLines=1; ellipsize=android.text.TextUtils.TruncateAt.END })
         header.addView(label(p.subtitle.ifEmpty { p.title }, 24f).apply { maxLines = 2; ellipsize=android.text.TextUtils.TruncateAt.END; setTypeface(null, Typeface.BOLD) })
         val date = runCatching { java.time.LocalDate.parse(p.date.take(10)).format(java.time.format.DateTimeFormatter.ofPattern("d MMM yyyy", java.util.Locale.UK)) }.getOrDefault(p.date.take(10))
-        val meta = listOf(p.duration, date, if (p.uhd) { if (p.hdr) "4K HDR available" else "4K available" } else "").filter { it.isNotBlank() }.joinToString("   ·   ")
+        val meta = listOf(p.duration, date).filter { it.isNotBlank() }.joinToString("   ·   ")
         header.addView(label(meta, 13f, true).apply { maxLines=1; ellipsize=android.text.TextUtils.TruncateAt.END })
         info.addView(header,RelativeLayout.LayoutParams(-1,-2).apply { addRule(RelativeLayout.ALIGN_PARENT_TOP) })
         val description = label(p.summary, 16f).apply { setTextColor(0xFFD5D3DD.toInt()); setLineSpacing(dp(3).toFloat(), 1f) }
@@ -487,7 +579,7 @@ class MainActivity : ComponentActivity() {
         playButton.requestFocus()
     }
     private fun play(p: Programme, next: Programme?, restart: Boolean) { startActivity(Intent(this, PlaybackActivity::class.java).putExtra("episode", p.json().toString()).putExtra("next", next?.json()?.toString()).putExtra("restart", restart)) }
-    private fun saved() { returnScreen = { saved() }; reset("Saved programmes"); val items = store.saved(); if (items.isEmpty()) content.addView(label("Save a programme from its episode page.", 20f, true)); grid(items, ::openShow) }
+    private fun saved() { returnScreen = { saved() }; reset("Saved programmes"); val items = store.saved(); if (items.isEmpty()) content.addView(label("Save a programme from its episode page.", 20f, true)); grid(items, ::openShow); applyEntryFocus() }
     private fun live() { returnScreen = { live() }; load("Live", { api.channels() }) { channels -> grid(channels.map { Programme(it.id, it.title, it.name, image = it.image) }) { p -> startActivity(Intent(this, PlaybackActivity::class.java).putExtra("channel", p.id).putExtra("title", p.title + " · " + p.subtitle)) } } }
     private fun saveBackupToDownloads(bytes: ByteArray) {
         if (android.os.Build.VERSION.SDK_INT < 29) {
@@ -566,6 +658,10 @@ class MainActivity : ComponentActivity() {
                 main.post { if (!isDestroyed) { backupProgress?.dismiss(); backupProgress = null; result.fold({ bytes -> saveBackupToDownloads(bytes) }, { Toast.makeText(this, "Unable to export this identity", Toast.LENGTH_LONG).show() }) } }
             } }
         })
+        content.addView(discoveryText("Restore encrypted UHD backup") {
+            runCatching { importBackupPicker.launch(arrayOf("application/octet-stream", "application/zip", "application/x-zip-compressed")) }
+                .onFailure { pendingRestore = null; Toast.makeText(this, "This device has no file picker for backups. Copy the backup to the TV and try again.", Toast.LENGTH_LONG).show() }
+        })
         if (api.vault.configured()) content.addView(discoveryText("Forget UHD identity") { AlertDialog.Builder(this).setMessage("Remove UHD setup from this app?").setPositiveButton("Forget") { _, _ -> api.vault.forget(); settings() }.setNegativeButton("Cancel", null).show() })
         content.addView(label("TV home", 22f))
         content.addView(discoveryText("Add live-channel cards to TV home") {
@@ -576,12 +672,12 @@ class MainActivity : ComponentActivity() {
             }, { Toast.makeText(this, "The launcher could not accept the live-channel row.", Toast.LENGTH_LONG).show() }) } }
         })
         content.addView(label("Subtitles", 22f))
-        content.addView(discoveryText("Captions on 10-second rewind: ${if (store.autoCaptions()) "On" else "Off"}") {
-            store.autoCaptions(!store.autoCaptions())
-            (content.findFocus() as? TextView)?.text="Captions on 10-second rewind: ${if(store.autoCaptions()) "On" else "Off"}"
-        })
+        lateinit var captionsRow: TextView
+        fun captionsText() = "Captions on 30-second rewind: ${if (store.autoCaptions()) "On" else "Off"}"
+        captionsRow = discoveryText(captionsText()) { store.autoCaptions(!store.autoCaptions()); captionsRow.text = captionsText() }
+        content.addView(captionsRow)
         content.addView(discoveryText("Android caption appearance settings") { runCatching { startActivity(Intent(android.provider.Settings.ACTION_CAPTIONING_SETTINGS)) }.onFailure { Toast.makeText(this, "Caption settings are unavailable on this device", Toast.LENGTH_LONG).show() } })
-        content.addView(label("Independent BBC player · GPL-3.0-or-later", 17f, true))
+        content.addView(label("Independent BBC player · GPL-3.0-or-later", 17f, true)); applyEntryFocus()
     }
 }
 

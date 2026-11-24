@@ -81,7 +81,7 @@ class DeviceTest {
         }
         assertTrue("Real BBC video must decode and advance", decoded)
         // Real transport actions: paused controls must persist, playing controls must fade,
-        // and a modal quality sheet must remain usable beyond the fade timeout.
+        // and a modal details sheet must remain usable beyond the fade timeout.
         instrument.runOnMainSync { activity.debugControls().play.performClick() }
         Thread.sleep(2000)
         var ui = JSONObject()
@@ -91,11 +91,11 @@ class DeviceTest {
         Thread.sleep(2500)
         instrument.runOnMainSync { ui = activity.debugSnapshot() }
         assertFalse("Transport must fade during playback", ui.optBoolean("controlsVisible"))
-        instrument.runOnMainSync { activity.debugControls().show(); activity.debugControls().quality.performClick() }
+        instrument.runOnMainSync { activity.debugControls().show(); activity.debugControls().debugOpenDetails() }
         Thread.sleep(2000)
         var open = false
         instrument.runOnMainSync { open = activity.debugControls().debugDialogShowing(); activity.debugControls().debugDismissDialog() }
-        assertTrue("Quality dialog must survive the transport timeout", open)
+        assertTrue("Details dialog must survive the transport timeout", open)
         instrument.runOnMainSync { activity.debugControls().show(); activity.debugControls().play.performClick() }
         Thread.sleep(500)
         instrument.uiAutomation.takeScreenshot()?.let { bitmap -> context.filesDir.resolve("cinema-controls.png").outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) } }

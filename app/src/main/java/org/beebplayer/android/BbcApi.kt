@@ -71,6 +71,18 @@ class BbcApi(private val context: Context) {
         val pid=Parsing.pid(id)
         return PlaybackVersions.episode(get("https://ibl.api.bbc.co.uk/ibl/v1/episodes/$pid"),pid)
     }
+    /** Wall-clock start of the programme currently airing on [channel], if the schedule says. */
+    fun currentProgrammeStart(channel: String): Long? = runCatching {
+        require(channel.matches(Regex("[a-z0-9_]{1,80}")))
+        val now = Instant.now()
+        json("https://ibl.api.bbc.co.uk/ibl/v1/channels/$channel/broadcasts?per_page=20")
+            .optJSONObject("broadcasts")?.list("elements")
+            ?.firstOrNull { b ->
+                !b.optBoolean("blanked") &&
+                    Instant.parse(b.text("scheduled_start")) <= now && now < Instant.parse(b.text("scheduled_end"))
+            }
+            ?.let { Instant.parse(it.text("scheduled_start")).toEpochMilli() }
+    }.getOrNull()
     fun channels(): List<Channel> = json("https://ibl.api.bbc.co.uk/ibl/v1/channels").list("channels").filter { it.optBoolean("has_schedule") }.map { j ->
         val id = j.text("id"); val name = j.text("title")
         runCatching {
