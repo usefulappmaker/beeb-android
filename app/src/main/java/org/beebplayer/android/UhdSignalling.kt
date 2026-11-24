@@ -3,7 +3,9 @@ package org.beebplayer.android
 
 object UhdSignalling {
     fun hlg(bytes: ByteArray): Boolean {
-        for(i in 4 until bytes.size-13) {
+        // A complete colr box occupies twelve bytes from its type: type(4) kind(4) primaries(2) transfer(2).
+        // The scan must include a box that ends exactly on the last byte of a truncated fetch.
+        for(i in 4..bytes.size-12) {
             if(bytes[i]!=99.toByte() || bytes[i+1]!=111.toByte() || bytes[i+2]!=108.toByte() || bytes[i+3]!=114.toByte()) continue
             val kind=bytes.copyOfRange(i+4,i+8).toString(Charsets.US_ASCII)
             if(kind!="nclx" && kind!="nclc")continue

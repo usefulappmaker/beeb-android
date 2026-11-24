@@ -22,7 +22,7 @@ data class Programme(val id: String, val title: String, val subtitle: String = "
             require(j.text("id").matches(Regex("[a-z0-9]{8}"))) { "Invalid episode identifier" }
             val v = PlaybackVersions.available(j).firstOrNull() ?: error("No standard version of this episode is currently available.")
             val sub = j.text("subtitle")
-            return Programme(j.text("id"), j.text("title"), sub, j.fields("synopses", "large", "medium", "small"), artwork(j.optJSONObject("images"), episode = true), v.text("id"), j.text("tleo_id", j.text("id")), v.optBoolean("uhd"), v.optBoolean("hdr"), v.optJSONObject("duration")?.text("text").orEmpty(), if (j.text("slice_id") != "" && sub.contains(": ")) sub.substringBefore(": ") else "Episodes", j.optInt("parent_position"), j.text("release_date_time"))
+            return Programme(j.text("id"), j.text("title"), sub, j.fields("synopses", "large", "medium", "small"), artwork(j.optJSONObject("images"), episode = true), v.text("id"), j.text("tleo_id", j.text("id")), v.optBoolean("uhd"), v.optBoolean("hdr"), v.optJSONObject("duration")?.text("text").orEmpty(), SeriesCatalog.label(sub), j.optInt("parent_position"), j.text("release_date_time"))
         }
         fun show(j: JSONObject) = Programme(j.text("id"), j.text("title"), summary = j.optJSONObject("synopses")?.text("medium").orEmpty(), image = artwork(j.optJSONObject("images")), uhd = j.list("initial_children").any { it.list("versions").any { v -> v.optBoolean("uhd") } })
     }
@@ -110,9 +110,6 @@ object Parsing {
             } else null
         }.sortedWith(compareByDescending<Variant> { it.height }.thenByDescending { it.bandwidth }).toList()
     }
-    fun ordered(items: List<Programme>): List<Programme> {
-        fun series(p: Programme) = Regex("(?:Series|Season)\\s+(\\d+)", RegexOption.IGNORE_CASE).find(p.series)?.groupValues?.get(1)?.toIntOrNull() ?: Int.MAX_VALUE
-        return items.sortedWith(compareBy<Programme> { series(it) }.thenBy { it.series }.thenBy { if (it.position > 0) it.position else Int.MAX_VALUE }.thenBy { it.date }.thenBy { it.subtitle })
-    }
+    fun ordered(items: List<Programme>): List<Programme> = SeriesCatalog.ordered(items)
     fun finished(position: Long, duration: Long, ended: Boolean) = ended || (duration > 0 && position >= duration * .95 && duration - position <= 120_000)
 }

@@ -4,7 +4,9 @@ import okhttp3.tls.HeldCertificate
 import org.junit.Assert.*
 import org.junit.Test
 import java.util.Base64
+import java.security.KeyFactory
 import java.security.KeyStore
+import java.security.spec.PKCS8EncodedKeySpec
 import java.util.concurrent.TimeUnit
 
 class DirectUhdSetupTest {
@@ -33,5 +35,15 @@ class DirectUhdSetupTest {
         assertTrue(runCatching {session.commit { saved=true }}.isFailure);assertFalse(saved)
         val init=byteArrayOf(0,0,0,19)+"colrnclx".toByteArray()+byteArrayOf(0,9,0,18,0,9,0)
         assertTrue(UhdSignalling.hlg(init));init[15]=16;assertFalse(UhdSignalling.hlg(init))
+    }
+    private fun pkcs1Of(held: HeldCertificate): ByteArray =
+        Base64.getMimeDecoder().decode(held.privateKeyPkcs1Pem().substringAfter("-----BEGIN RSA PRIVATE KEY-----").substringBefore("-----END RSA PRIVATE KEY-----"))
+    @Test fun legacyPemKeyIsWrappedIntoValidPkcs8() {
+        val held = HeldCertificate.Builder().rsa2048().commonName("Synthetic legacy fixture").build()
+        val pkcs1 = pkcs1Of(held)
+        assertTrue("fixture must need long-form DER lengths", pkcs1.size > 128)
+        val rebuilt = DirectUhdSetup.wrapRsa(pkcs1)
+        val parsed = KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(rebuilt))
+        assertArrayEquals(held.keyPair.private.encoded, parsed.encoded)
     }
 }

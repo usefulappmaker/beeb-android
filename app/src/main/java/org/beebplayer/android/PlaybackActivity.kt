@@ -67,7 +67,7 @@ class PlaybackActivity : ComponentActivity() {
             val pos = player.currentPosition
             val active = source?.skips?.firstOrNull { it.contains(pos) }
             currentSkip = active
-            extras.update(active, next)
+            extras.update(active, next); wireFocusLayers()
             if (temporaryUntil >= 0 && pos >= temporaryUntil) restoreCaptions()
             if (System.currentTimeMillis() - lastSave >= 5000) { save(); lastSave = System.currentTimeMillis() }
             main.postDelayed(this, 300)
@@ -81,17 +81,18 @@ class PlaybackActivity : ComponentActivity() {
         next = intent.getStringExtra("next")?.let { Programme.restore(JSONObject(it)) }
         resume = savedInstanceState?.getLong("position") ?: if (intent.getBooleanExtra("restart", false)) 0 else episode?.let(store::resume) ?: 0
         val renderers = DefaultRenderersFactory(this).setEnableDecoderFallback(true).forceDisableMediaCodecAsynchronousQueueing()
-        player = ExoPlayer.Builder(this, renderers).setSeekBackIncrementMs(10_000).setSeekForwardIncrementMs(10_000).build().apply { setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(), true); setHandleAudioBecomingNoisy(true) }
+        player = ExoPlayer.Builder(this, renderers).setSeekBackIncrementMs(30_000).setSeekForwardIncrementMs(30_000).build().apply { setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(), true); setHandleAudioBecomingNoisy(true) }
         val root = object : FrameLayout(this) {
             override fun dispatchKeyEvent(event: KeyEvent): Boolean = if (handlePlaybackKey(event)) true else super.dispatchKeyEvent(event)
         }.apply { setBackgroundColor(Color.BLACK) }
-        view = PlayerView(this).apply { player = this@PlaybackActivity.player; useController = true; controllerShowTimeoutMs = 1500; controllerAutoShow = true; setShowSubtitleButton(true); keepScreenOn = true }
+        view = PlayerView(this).apply { player = this@PlaybackActivity.player; useController = true; controllerShowTimeoutMs = NativePlayerExtras.HUD_TIMEOUT_MS; controllerAutoShow = true; setShowSubtitleButton(true); keepScreenOn = true }
         root.addView(view, FrameLayout.LayoutParams(-1, -1))
-        extras = NativePlayerExtras(this, player, view, episode, intent.getStringExtra("title").orEmpty(), ::playNext)
+        extras = NativePlayerExtras(this, player, view, episode, intent.getStringExtra("title").orEmpty(), ::playNext, live = episode == null, restartAction = ::restartCurrentProgramme)
         root.addView(extras, FrameLayout.LayoutParams(-1, -1))
         status = text("Finding the best available stream…", 20f).apply { setBackgroundColor(0xCC101016.toInt()); maxWidth = dp(650) }
         root.addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
         setContentView(root)
+        wireFocusLayers()
         captionManager = getSystemService(CAPTIONING_SERVICE) as android.view.accessibility.CaptioningManager
         captionManager.addCaptioningChangeListener(captionListener)
         applyCaptionAppearance()
@@ -103,7 +104,7 @@ class PlaybackActivity : ComponentActivity() {
         })
         player.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
-                if (state == Player.STATE_READY) { status.visibility = View.GONE; extras.ready(); badge(); extras.scheduleHide() }
+                if (state == Player.STATE_READY) { status.visibility = View.GONE; wireFocusLayers(); extras.ready(); badge(); extras.scheduleHide() }
                 if (state == Player.STATE_ENDED) { episode?.let { store.update(it, next, player.duration, player.duration, true) }; extras.show(); extras.update(currentSkip, next) }
                 diagnostic("state-$state")
             }
@@ -129,6 +130,113 @@ class PlaybackActivity : ComponentActivity() {
             io.execute {
                 val following = runCatching { api.episodes(Programme(current.showId, current.title)).let { items -> items.indexOfFirst { it.id == current.id }.takeIf { it >= 0 }?.let { items.getOrNull(it + 1) } } }.getOrNull()
                 main.post { if (alive) next = following }
+            }
+        }
+    }
+    /**
+     * Up from any transport button climbs to the action row; Down from the action row returns to
+     * play/pause. Without this the D-pad used spatial search and could jump to Subtitles instead.
+     */
+    /**
+     * TV safe area from the panel itself. Media3 inflates a <merge>, so the scrubber
+     * (exo_progress_placeholder) and the bottom bar (time labels, subtitle, settings) are
+     * siblings: padding the bar alone moved nothing, which is why the first attempt did nothing.
+     */
+    private fun applyHudInsets() {
+        // Ask the window how big it actually is (TVs report the full panel here), then lay the
+        // controller out to fill that area with a standard action-safe margin - 5% of the panel,
+        // floored in dp - so the scrubber, the time labels and the cog all fit exactly.
+        val bounds = if (android.os.Build.VERSION.SDK_INT >= 30) windowManager.currentWindowMetrics.bounds else null
+        val width = bounds?.width() ?: resources.displayMetrics.widthPixels
+        val height = bounds?.height() ?: resources.displayMetrics.heightPixels
+        val side = maxOf((width * 0.05f).toInt(), dp(32))
+        val top = maxOf((height * 0.03f).toInt(), dp(20))
+        val bottom = maxOf((height * 0.05f).toInt(), dp(28))
+        val anchor = view.findViewById<View>(androidx.media3.ui.R.id.exo_progress_placeholder)
+            ?: view.findViewById<View>(androidx.media3.ui.R.id.exo_bottom_bar)
+            ?: return
+        var container: View = anchor
+        var guard = 0
+        while (container.parent is View && container.parent !== view && guard++ < 6) container = container.parent as View
+        if (container === view) {
+            anchor.setPadding(side, anchor.paddingTop, side, bottom)
+        } else if (container.paddingLeft != side || container.paddingRight != side ||
+            container.paddingBottom != bottom || container.paddingTop != top) {
+            container.setPadding(side, top, side, bottom)
+        }
+        extras.setSafeInsets(side, top)
+        // Subtitles clear the bottom margin and rise above the controls when they are showing.
+        val heightFraction = maxOf(0.10f, (bottom + dp(16)) / height.toFloat())
+        view.subtitleView?.setBottomPaddingFraction(if (extras.visible) heightFraction + 0.16f else heightFraction)
+    }
+
+    private fun wireFocusLayers() {
+        applyHudInsets()
+        val anchor = extras.anchorId
+        val playPause = view.findViewById<View>(androidx.media3.ui.R.id.exo_play_pause)
+        val scrubber = view.findViewById<View>(androidx.media3.ui.R.id.exo_progress)
+            ?: view.findViewById<View>(androidx.media3.ui.R.id.exo_progress_placeholder)
+        scrubber?.isFocusable = true
+        scrubber?.nextFocusUpId = playPause?.id ?: View.NO_ID
+        val transport = intArrayOf(
+            androidx.media3.ui.R.id.exo_play_pause,
+            androidx.media3.ui.R.id.exo_rew,
+            androidx.media3.ui.R.id.exo_rew_with_amount,
+            androidx.media3.ui.R.id.exo_ffwd,
+            androidx.media3.ui.R.id.exo_ffwd_with_amount,
+            androidx.media3.ui.R.id.exo_subtitle,
+            androidx.media3.ui.R.id.exo_settings,
+        )
+        for (id in transport) view.findViewById<View>(id)?.let { button ->
+            button.nextFocusUpId = anchor
+            button.nextFocusDownId = scrubber?.id ?: View.NO_ID
+            tintFocus(button)
+        }
+        playPause?.let { extras.bindController(it) }
+    }
+
+    /** BBC pink marks the focused transport button so the current position is unmistakable. */
+    private val focusStyled = java.util.Collections.newSetFromMap(java.util.WeakHashMap<View, Boolean>())
+    private fun tintFocus(target: View) {
+        if (!focusStyled.add(target)) return
+        val pink = Color.rgb(250, 35, 137); val ink = Color.rgb(16, 16, 22)
+        fun paint(on: Boolean) {
+            target.background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(22).toFloat()
+                setColor(if (on) pink else Color.TRANSPARENT)
+            }
+            (target as? android.widget.ImageView)?.imageTintList = android.content.res.ColorStateList.valueOf(if (on) ink else Color.WHITE)
+        }
+        paint(target.hasFocus())
+        target.setOnFocusChangeListener { _, on -> paint(on) }
+    }
+    /**
+     * Restart means "the start of the programme now airing", not the start of the rewind window:
+     * the window usually still holds the end of the previous programme. The schedule gives the
+     * programme's wall-clock start, which is converted to a media position using the live offset.
+     */
+    private fun restartCurrentProgramme() {
+        val channel = intent.getStringExtra("channel")
+        if (channel == null) { player.seekTo(0); return }
+        io.execute {
+            val start = runCatching { api.currentProgrammeStart(channel) }.getOrNull()
+            main.post {
+                if (!alive) return@post
+                val liveOffset = player.currentLiveOffset
+                val elapsed = start?.let { System.currentTimeMillis() - it }
+                val target = if (elapsed != null && elapsed > 0 && liveOffset != C.TIME_UNSET) {
+                    player.currentPosition + liveOffset - elapsed
+                } else {
+                    null
+                }
+                when {
+                    target == null -> {
+                        player.seekTo(0)
+                        Toast.makeText(this, "Restarting from the start of this channel's rewind window", Toast.LENGTH_LONG).show()
+                    }
+                    target <= 0 -> Toast.makeText(this, "This programme began before the channel's rewind window, so it cannot be restarted.", Toast.LENGTH_LONG).show()
+                    else -> { player.seekTo(target); Toast.makeText(this, "Restarted this programme", Toast.LENGTH_SHORT).show() }
+                }
             }
         }
     }
@@ -175,6 +283,8 @@ class PlaybackActivity : ComponentActivity() {
             setApplyEmbeddedFontSizes(false)
             setStyle(CaptionStyleCompat.createFromCaptionStyle(captionManager.userStyle))
             setFractionalTextSize(.040f * captionManager.fontScale)
+            // Internal padding so a second caption line never touches the safe-area edge.
+            setPadding(dp(24), 0, dp(24), dp(10))
         }
     }
     override fun onResume() { super.onResume(); applyCaptionAppearance() }
@@ -196,7 +306,7 @@ class PlaybackActivity : ComponentActivity() {
             player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false).setPreferredTextLanguage("en").setSelectUndeterminedTextLanguage(true).build()
             settingTemporaryCaptions = false
         }
-        if (player.isCurrentMediaItemSeekable) player.seekTo(maxOf(0, previous - 10_000))
+        if (player.isCurrentMediaItemSeekable) player.seekTo(maxOf(0, previous - 30_000))
         extras.show(); if (temporaryUntil >= 0) extras.replayNotice()
     }
     private fun restoreCaptions() { settingTemporaryCaptions = true; originalTextParameters?.let { player.trackSelectionParameters = it }; originalTextParameters = null; temporaryUntil = -1; settingTemporaryCaptions = false; extras.dismissTransientNotice() }
@@ -208,12 +318,12 @@ class PlaybackActivity : ComponentActivity() {
         if (event.action == KeyEvent.ACTION_DOWN) {
             when (event.keyCode) {
                 KeyEvent.KEYCODE_MEDIA_REWIND -> { rewind(); return true }
-                KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { if (player.isCurrentMediaItemSeekable) player.seekTo(player.currentPosition + 10_000); extras.show(); return true }
+                KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> { if (player.isCurrentMediaItemSeekable) player.seekTo(player.currentPosition + 30_000); extras.show(); return true }
                 KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> { if (player.playWhenReady) player.pause() else player.play(); extras.show(); return true }
                 KeyEvent.KEYCODE_MEDIA_PLAY -> { player.play(); extras.show(); return true }
                 KeyEvent.KEYCODE_MEDIA_PAUSE -> { player.pause(); extras.show(); return true }
                 KeyEvent.KEYCODE_DPAD_LEFT -> if (!extras.visible && !extras.skip.hasFocus()) { rewind(); return true }
-                KeyEvent.KEYCODE_DPAD_RIGHT -> if (!extras.visible && !extras.skip.hasFocus()) { if (player.isCurrentMediaItemSeekable) player.seekTo(player.currentPosition + 10_000); extras.show(); return true }
+                KeyEvent.KEYCODE_DPAD_RIGHT -> if (!extras.visible && !extras.skip.hasFocus()) { if (player.isCurrentMediaItemSeekable) player.seekTo(player.currentPosition + 30_000); extras.show(); return true }
             }
             if (event.keyCode in listOf(KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER)) {
                 if (!extras.visible && !extras.skip.hasFocus()) { extras.show(); return true }
@@ -232,7 +342,7 @@ class PlaybackActivity : ComponentActivity() {
     }
     internal fun debugSnapshot(): JSONObject {
         check(BuildConfig.DEBUG)
-        return JSONObject().put("positionMs", player.currentPosition).put("height", player.videoFormat?.height ?: 0).put("playing", player.isPlaying).put("subtitleTrackCount", player.currentTracks.groups.count { it.type == C.TRACK_TYPE_TEXT }).put("quality", extras.quality.text).put("controlsVisible", extras.visible).put("playLabel", extras.play.contentDescription).put("captionSamples", captionSamples).put("captionsEnabled", !player.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)).put("captionFontScale", captionManager.fontScale).put("liveCaptionBridge", source?.liveCaptions != null).put("liveCaptionStatus", source?.liveCaptions?.debugSummary.orEmpty()).put("nativeTextSelected", player.currentTracks.groups.any { it.type == C.TRACK_TYPE_TEXT && it.isSelected }).put("failure", playerFailure).put("failureDetail", failureDetail)
+        return JSONObject().put("positionMs", player.currentPosition).put("height", player.videoFormat?.height ?: 0).put("playing", player.isPlaying).put("subtitleTrackCount", player.currentTracks.groups.count { it.type == C.TRACK_TYPE_TEXT }).put("quality", "").put("controlsVisible", extras.visible).put("playLabel", extras.play.contentDescription).put("captionSamples", captionSamples).put("captionsEnabled", !player.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)).put("captionFontScale", captionManager.fontScale).put("liveCaptionBridge", source?.liveCaptions != null).put("liveCaptionStatus", source?.liveCaptions?.debugSummary.orEmpty()).put("nativeTextSelected", player.currentTracks.groups.any { it.type == C.TRACK_TYPE_TEXT && it.isSelected }).put("failure", playerFailure).put("failureDetail", failureDetail)
     }
     internal fun debugRewindCheck() {
         check(BuildConfig.DEBUG); restoreCaptions()

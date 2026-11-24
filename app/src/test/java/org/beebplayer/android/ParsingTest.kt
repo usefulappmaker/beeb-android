@@ -40,6 +40,16 @@ class ParsingTest {
         val marker = Skip.parse(version).single()
         assertFalse(marker.contains(9999)); assertTrue(marker.contains(10000)); assertFalse(marker.contains(30000))
     }
+    @Test fun seriesComesFromTheSubtitleEvenWithoutASliceId() {
+        // Only Connect and University Challenge return no slice_id, which used to collapse
+        // every episode into one flat "Episodes" list.
+        val onlyConnect = JSONObject("""{"id":"m0000001","title":"Only Connect","subtitle":"Series 22: 18. Ad Astra v Makeweights","versions":[{"id":"m0000011","kind":"original"}]}""")
+        assertEquals("Series 22", Programme.episode(onlyConnect).series)
+        val universityChallenge = JSONObject("""{"id":"m0000002","title":"University Challenge","subtitle":"2025/26: 37. Grand Final: Edinburgh v Manchester","versions":[{"id":"m0000012","kind":"original"}]}""")
+        assertEquals("2025/26", Programme.episode(universityChallenge).series)
+        val ungrouped = JSONObject("""{"id":"m0000003","title":"Garden Rescue","subtitle":"Episode 4","versions":[{"id":"m0000013","kind":"original"}]}""")
+        assertEquals(SeriesCatalog.EPISODES, Programme.episode(ungrouped).series)
+    }
     @Test fun orderingAndCreditsCompletionUseMetadata() {
         val p = Programme("m0000001", "Show", series = "Series 2", position = 1)
         val q = Programme("m0000002", "Show", series = "Series 1", position = 2)
